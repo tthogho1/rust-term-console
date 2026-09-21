@@ -1,69 +1,77 @@
-//! GUI rendering (FR-6, FR-7). Two screens: the connect dialog (FR-2, FR-3)
-//! and the live terminal (log + input + status bar).
+//! GUI rendering (FR-6, FR-7). The window is always the terminal (header +
+//! log + input); the connect form (FR-2, FR-3) is a left side panel toggled
+//! by the header's "Connection" button, and the notebook cells are a right
+//! side panel toggled from the header's "View" menu. Cells only send
+//! commands; their output lands in the shared log.
 
 use eframe::egui::{self, Color32, ComboBox, RichText, ScrollArea, TextEdit};
 
 use crate::app::{AuthMode, ConnMode, ConnectForm, Session};
-use crate::connection::{Connection, NewlineMode};
+use crate::connection::NewlineMode;
 
 pub enum ConnectAction {
     None,
-    Connected(Box<dyn Connection>, NewlineMode),
+    /// The Connect button was pressed; the caller opens the connection.
+    Connect,
 }
 
-pub enum TerminalAction {
+pub enum HeaderAction {
     None,
     Disconnect,
 }
 
+/// Connect form, drawn as a left side panel. Call only while it is shown.
 pub fn draw_connect(ui: &mut egui::Ui, form: &mut ConnectForm) -> ConnectAction {
     let mut action = ConnectAction::None;
 
-    egui::CentralPanel::default().show(ui, |ui| {
-        ui.heading("rust-term-console");
-        ui.label("Connect over SSH or a serial port.");
-        ui.separator();
-
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut form.mode, ConnMode::Ssh, "SSH");
-            ui.radio_value(&mut form.mode, ConnMode::Serial, "Serial");
+    egui::Panel::left("connect_panel").default_size(320.0).show(ui, |ui| {
+        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            draw_connect_form(ui, form, &mut action);
         });
-        ui.add_space(8.0);
-
-        match form.mode {
-            ConnMode::Ssh => draw_ssh_fields(ui, form),
-            ConnMode::Serial => draw_serial_fields(ui, form),
-        }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("Newline on Enter:");
-            ComboBox::from_id_salt("newline_mode")
-                .selected_text(form.newline.label())
-                .show_ui(ui, |ui| {
-                    for mode in NewlineMode::ALL {
-                        ui.selectable_value(&mut form.newline, mode, mode.label());
-                    }
-                });
-        });
-
-        ui.separator();
-        draw_profiles(ui, form);
-
-        ui.add_space(8.0);
-        if let Some(err) = &form.error {
-            ui.colored_label(Color32::from_rgb(220, 60, 60), err);
-        }
-
-        if ui.button(RichText::new("Connect").strong()).clicked() {
-            let newline = form.newline;
-            if let Some(conn) = form.connect() {
-                action = ConnectAction::Connected(conn, newline);
-            }
-        }
     });
 
     action
+}
+
+fn draw_connect_form(ui: &mut egui::Ui, form: &mut ConnectForm, action: &mut ConnectAction) {
+    ui.heading("Connection");
+    ui.label("Connect over SSH or a serial port.");
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut form.mode, ConnMode::Ssh, "SSH");
+        ui.radio_value(&mut form.mode, ConnMode::Serial, "Serial");
+    });
+    ui.add_space(8.0);
+
+    match form.mode {
+        ConnMode::Ssh => draw_ssh_fields(ui, form),
+        ConnMode::Serial => draw_serial_fields(ui, form),
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label("Newline on Enter:");
+        ComboBox::from_id_salt("newline_mode")
+            .selected_text(form.newline.label())
+            .show_ui(ui, |ui| {
+                for mode in NewlineMode::ALL {
+                    ui.selectable_value(&mut form.newline, mode, mode.label());
+                }
+            });
+    });
+
+    ui.separator();
+    draw_profiles(ui, form);
+
+    ui.add_space(8.0);
+    if let Some(err) = &form.error {
+        ui.colored_label(Color32::from_rgb(220, 60, 60), err);
+    }
+
+    if ui.button(RichText::new("Connect").strong()).clicked() {
+        *action = ConnectAction::Connect;
+    }
 }
 
 fn draw_ssh_fields(ui: &mut egui::Ui, form: &mut ConnectForm) {
@@ -196,65 +204,159 @@ fn draw_profiles(ui: &mut egui::Ui, form: &mut ConnectForm) {
     });
 }
 
-pub fn draw_terminal(ui: &mut egui::Ui, session: &mut Session) -> TerminalAction {
-    let mut action = TerminalAction::None;
+/// Top header bar: the "Connection" toggle, the "View" menu and connection
+/// status.
+pub fn draw_header(
+    ui: &mut egui::Ui,
+    session: Option<&mut Session>,
+    show_connect: &mut bool,
+    show_notebook: &mut bool,
+) -> HeaderAction {
+    let mut action = HeaderAction::None;
 
-    egui::Panel::top("status_bar").show(ui, |ui| {
+    egui::Panel::top("header").show(ui, |ui| {
         ui.horizontal(|ui| {
-            let (text, color) = if session.connected {
+            if ui.selectable_label(*show_connect, "Connection").clicked() {
+                *show_connect = !*show_connect;
+            }
+            ui.menu_button("View", |ui| {
+                ui.checkbox(show_notebook, "Notebook");
+            });
+            ui.separator();
+
+            let connected = session.as_ref().is_some_and(|s| s.connected);
+            let (text, color) = if connected {
                 ("CONNECTED", Color32::from_rgb(30, 150, 60))
             } else {
                 ("DISCONNECTED", Color32::from_rgb(190, 40, 40))
             };
             ui.colored_label(color, RichText::new(text).strong());
-            ui.label(session.connection_label().to_string());
-            ui.separator();
-            ComboBox::from_id_salt("live_newline")
-                .selected_text(session.newline_mode.label())
-                .show_ui(ui, |ui| {
-                    for mode in NewlineMode::ALL {
-                        ui.selectable_value(&mut session.newline_mode, mode, mode.label());
-                    }
-                });
-            ui.separator();
-            ui.label(session.status.clone());
+
+            match session {
+                Some(session) => {
+                    ui.label(session.connection_label().to_string());
+                    ui.separator();
+                    ComboBox::from_id_salt("live_newline")
+                        .selected_text(session.newline_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in NewlineMode::ALL {
+                                ui.selectable_value(&mut session.newline_mode, mode, mode.label());
+                            }
+                        });
+                    ui.separator();
+                    ui.label(session.status.clone());
+                }
+                None => {
+                    ui.label("Not connected");
+                }
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Disconnect").clicked() {
-                    action = TerminalAction::Disconnect;
+                if ui.add_enabled(connected, egui::Button::new("Disconnect")).clicked() {
+                    action = HeaderAction::Disconnect;
                 }
             });
         });
     });
 
-    egui::Panel::bottom("input_bar").show(ui, |ui| {
-        ui.horizontal(|ui| {
-            let response = ui.add_enabled(
-                session.connected,
-                TextEdit::singleline(&mut session.input)
-                    .desired_width(ui.available_width() - 70.0)
-                    .hint_text("Type and press Enter to send"),
-            );
-            let send_clicked = ui.add_enabled(session.connected, egui::Button::new("Send")).clicked();
+    action
+}
 
-            let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if session.connected && (enter_pressed || send_clicked) {
-                session.send_current_input();
-                response.request_focus();
-            } else if !response.has_focus() && session.connected {
-                response.request_focus();
+/// Notebook cells, drawn as a right side panel. Call only while it is shown.
+///
+/// Returns the text of a cell whose Run button (or Shift+Enter) was hit; the
+/// caller sends it. `can_run` is false while there is no live connection.
+pub fn draw_notebook(ui: &mut egui::Ui, cells: &mut Vec<String>, can_run: bool) -> Option<String> {
+    let mut to_run = None;
+
+    egui::Panel::right("notebook_panel").default_size(340.0).show(ui, |ui| {
+        ui.heading("Notebook");
+        ui.label("Run a cell to send it; output appears in the log.");
+        ui.separator();
+
+        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let mut remove = None;
+            for (i, cell) in cells.iter_mut().enumerate() {
+                let id = ui.make_persistent_id(("notebook_cell", i));
+                let focused = ui.memory(|m| m.has_focus(id));
+                let shift_enter =
+                    focused && ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
+
+                ui.add(
+                    TextEdit::multiline(cell)
+                        .id(id)
+                        .code_editor()
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Command (Shift+Enter to run)"),
+                );
+
+                ui.horizontal(|ui| {
+                    let run_clicked = ui.add_enabled(can_run, egui::Button::new("Run")).clicked();
+                    if (run_clicked || (shift_enter && can_run)) && !cell.trim().is_empty() {
+                        to_run = Some(cell.clone());
+                    }
+                    if ui.button("Delete").clicked() {
+                        remove = Some(i);
+                    }
+                });
+                ui.separator();
+            }
+            if let Some(i) = remove {
+                cells.remove(i);
+            }
+
+            if ui.button("+ Add cell").clicked() {
+                cells.push(String::new());
+            }
+        });
+    });
+
+    to_run
+}
+
+/// Input bar and scrolling log. `session` is `None` until the first connect.
+pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
+    egui::Panel::bottom("input_bar").show(ui, |ui| {
+        ui.horizontal(|ui| match session.as_deref_mut() {
+            Some(session) => {
+                let response = ui.add_enabled(
+                    session.connected,
+                    TextEdit::singleline(&mut session.input)
+                        .desired_width(ui.available_width() - 70.0)
+                        .hint_text("Type and press Enter to send"),
+                );
+                let send_clicked = ui.add_enabled(session.connected, egui::Button::new("Send")).clicked();
+
+                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if session.connected && (enter_pressed || send_clicked) {
+                    session.send_current_input();
+                    response.request_focus();
+                } else if session.connected && ui.memory(|m| m.focused().is_none()) {
+                    response.request_focus();
+                }
+            }
+            None => {
+                ui.add_enabled(
+                    false,
+                    TextEdit::singleline(&mut String::new())
+                        .desired_width(ui.available_width() - 70.0)
+                        .hint_text("Not connected"),
+                );
+                ui.add_enabled(false, egui::Button::new("Send"));
             }
         });
     });
 
     egui::CentralPanel::default().show(ui, |ui| {
         ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-            ui.add(egui::Label::new(RichText::new(session.log_text()).monospace()).wrap().selectable(true));
+            if let Some(session) = session.as_deref() {
+                ui.add(egui::Label::new(RichText::new(session.log_text()).monospace()).wrap().selectable(true));
+            }
         });
     });
 
-    if session.connected {
+    if session.is_some_and(|s| s.connected) {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
     }
-
-    action
 }

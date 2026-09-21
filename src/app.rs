@@ -1,7 +1,6 @@
 //! Application state and logic (FR-3..FR-8). `ui.rs` renders this state
 //! into egui widgets; this module owns the connect form, the live session
-//! (log buffer, input line, connection), and the screen transitions between
-//! them.
+//! (log buffer, input line, connection).
 
 use std::borrow::Cow;
 
@@ -302,25 +301,37 @@ impl Session {
         if !self.connected || self.input.is_empty() {
             return;
         }
-        let mut payload = self.input.clone().into_bytes();
-        payload.extend_from_slice(self.newline_mode.as_bytes());
+        let text = std::mem::take(&mut self.input);
+        self.send_text(&text);
+    }
 
-        // Local echo so the sent line is visible even if the remote doesn't
-        // echo it back.
-        let echoed = self.input.clone().into_bytes();
-        self.append_log(&echoed);
-        self.append_log(self.newline_mode.as_bytes());
+    /// Send `text` one line at a time, each followed by the configured
+    /// newline. Used by the input bar and by notebook cells, so both show up
+    /// in the log the same way.
+    pub fn send_text(&mut self, text: &str) {
+        if !self.connected {
+            return;
+        }
+        for line in text.lines() {
+            let mut payload = line.as_bytes().to_vec();
+            payload.extend_from_slice(self.newline_mode.as_bytes());
 
-        if let Some(conn) = self.connection.as_mut()
-            && let Err(e) = conn.write_all(&payload)
-        {
-            self.status = format!("Send failed: {e}");
-            self.connected = false;
-            if let Some(mut conn) = self.connection.take() {
-                conn.close();
+            // Local echo so the sent line is visible even if the remote
+            // doesn't echo it back.
+            self.append_log(line.as_bytes());
+            self.append_log(self.newline_mode.as_bytes());
+
+            if let Some(conn) = self.connection.as_mut()
+                && let Err(e) = conn.write_all(&payload)
+            {
+                self.status = format!("Send failed: {e}");
+                self.connected = false;
+                if let Some(mut conn) = self.connection.take() {
+                    conn.close();
+                }
+                return;
             }
         }
-        self.input.clear();
     }
 
     /// FR-8: close the connection cleanly.
@@ -329,17 +340,6 @@ impl Session {
             conn.close();
         }
         self.connected = false;
-    }
-}
-
-/// Top-level screen state driving the eframe update loop.
-pub enum Screen {
-    Connect(ConnectForm),
-    Terminal(Session),
-}
-
-impl Default for Screen {
-    fn default() -> Self {
-        Screen::Connect(ConnectForm::default())
+        self.status = "Disconnected".to_string();
     }
 }

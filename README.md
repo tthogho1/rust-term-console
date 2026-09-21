@@ -18,8 +18,12 @@ cargo build --release
 ```
 
 Binary lands at `target/release/rust-term-console` (`.exe` on Windows). Run
-it directly — no command-line arguments needed; a window opens straight
-into the connect screen.
+it directly — no command-line arguments needed; a window opens with the
+connect panel already open. Use the **Connection** button in the header to
+show or hide it. **View → Notebook** opens a right-hand panel of command
+cells: type a command, press **Run** (or Shift+Enter) and it is sent over
+the current connection. The command and its output appear in the main log,
+not in the cell.
 
 ## Using the app
 
@@ -64,19 +68,19 @@ into the connect screen.
   the same poll-driven reads.
 - `app.rs` holds `ConnectForm` (the dialog's fields and profile
   load/save/connect logic) and `Session` (log buffer capped at 2 MB, input
-  line, connection status) — both transport-agnostic — plus the `Screen`
-  enum that switches between them.
-- `ui.rs` is pure `egui` rendering: `draw_connect` and `draw_terminal` take
-  the current state and an `egui::Ui`, and report back what the user did
-  (`ConnectAction` / `TerminalAction`) rather than mutating screen state
-  themselves.
-- `main.rs` implements `eframe::App` and just dispatches to `ui.rs`,
-  transitioning `Screen` on `Connected`/`Disconnect`.
+  line, connection status) — both transport-agnostic.
+- `ui.rs` is pure `egui` rendering: `draw_header`, `draw_connect` (a left
+  side panel), `draw_notebook` (a right side panel) and `draw_terminal` take the current state and an
+  `egui::Ui`, and report back what the user did (`HeaderAction` /
+  `ConnectAction`) rather than mutating app state themselves.
+- `main.rs` implements `eframe::App`: it owns the form, the optional
+  `Session` and the panel's open/closed flag, and acts on those actions
+  (opening the connection, disconnecting).
 - Connecting is synchronous: a slow DNS lookup or SSH handshake briefly
   freezes the window. Fine for LAN/typical use; a background thread with a
   channel back to the UI is the natural next step for slow/unreliable
   networks.
-- Once connected, the terminal screen requests a repaint every ~30 ms so
+- Once connected, the terminal requests a repaint every ~30 ms so
   incoming data is picked up even without mouse/keyboard activity — needed
   because native GUI toolkits otherwise only redraw on input events.
 - `ansi.rs` strips ANSI/VT100 escape sequences (color, cursor movement,
