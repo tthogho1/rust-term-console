@@ -18,6 +18,9 @@ pub enum ConnectAction {
 pub enum HeaderAction {
     None,
     Disconnect,
+    /// Start logging to the path in the header's Log menu.
+    StartLog,
+    StopLog,
 }
 
 /// Connect form, drawn as a left side panel. Call only while it is shown.
@@ -60,6 +63,16 @@ fn draw_connect_form(ui: &mut egui::Ui, form: &mut ConnectForm, action: &mut Con
                 }
             });
     });
+
+    ui.add_space(8.0);
+    ui.checkbox(&mut form.log_enabled, "Save session log to file");
+    if form.log_enabled {
+        ui.add(
+            TextEdit::singleline(&mut form.log_path)
+                .desired_width(f32::INFINITY)
+                .hint_text("Log file path, e.g. ~/logs/session.log"),
+        );
+    }
 
     ui.separator();
     draw_profiles(ui, form);
@@ -204,13 +217,14 @@ fn draw_profiles(ui: &mut egui::Ui, form: &mut ConnectForm) {
     });
 }
 
-/// Top header bar: the "Connection" toggle, the "View" menu and connection
-/// status.
+/// Top header bar: the "Connection" toggle, the "View" and "Log" menus and
+/// connection status.
 pub fn draw_header(
     ui: &mut egui::Ui,
     session: Option<&mut Session>,
     show_connect: &mut bool,
     show_notebook: &mut bool,
+    log_path: &mut String,
 ) -> HeaderAction {
     let mut action = HeaderAction::None;
 
@@ -222,9 +236,39 @@ pub fn draw_header(
             ui.menu_button("View", |ui| {
                 ui.checkbox(show_notebook, "Notebook");
             });
-            ui.separator();
 
             let connected = session.as_ref().is_some_and(|s| s.connected);
+            let logging_to = session.as_ref().and_then(|s| s.log_path()).map(|p| p.display().to_string());
+            ui.menu_button("Log", |ui| {
+                if !connected {
+                    ui.label("Connect first to start logging.");
+                    return;
+                }
+                match &logging_to {
+                    Some(path) => {
+                        ui.label(format!("Logging to {path}"));
+                        if ui.button("Stop logging").clicked() {
+                            action = HeaderAction::StopLog;
+                            ui.close();
+                        }
+                    }
+                    None => {
+                        ui.label("Log file path");
+                        let response = ui.add(
+                            TextEdit::singleline(log_path)
+                                .desired_width(260.0)
+                                .hint_text("~/logs/session.log"),
+                        );
+                        let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button("Start logging").clicked() || enter_pressed {
+                            action = HeaderAction::StartLog;
+                            ui.close();
+                        }
+                    }
+                }
+            });
+            ui.separator();
+
             let (text, color) = if connected {
                 ("CONNECTED", Color32::from_rgb(30, 150, 60))
             } else {
@@ -235,6 +279,10 @@ pub fn draw_header(
             match session {
                 Some(session) => {
                     ui.label(session.connection_label().to_string());
+                    if let Some(path) = session.log_path() {
+                        ui.label(RichText::new("● LOG").color(Color32::from_rgb(30, 110, 200)))
+                            .on_hover_text(path.display().to_string());
+                    }
                     ui.separator();
                     ComboBox::from_id_salt("live_newline")
                         .selected_text(session.newline_mode.label())

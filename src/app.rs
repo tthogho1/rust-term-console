@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use crate::ansi::AnsiFilter;
 use crate::config::{self, Profile};
 use crate::connection::{Connection, NewlineMode};
+use crate::logfile::LogFile;
 use crate::serial::{self, SerialConfig};
 use crate::ssh::{SshAuth, SshConfig, SshConnection};
 
@@ -50,6 +51,10 @@ pub struct ConnectForm {
 
     pub newline: NewlineMode,
 
+    // Session logging (FR-O3).
+    pub log_enabled: bool,
+    pub log_path: String,
+
     // Profiles (FR-O4).
     pub available_profiles: Vec<String>,
     pub profile_name: String,
@@ -75,6 +80,8 @@ impl Default for ConnectForm {
             password: String::new(),
             key_path: String::new(),
             newline: NewlineMode::CrLf,
+            log_enabled: false,
+            log_path: String::new(),
             available_profiles: config::list_profiles().unwrap_or_default(),
             profile_name: String::new(),
             error: None,
@@ -234,6 +241,8 @@ pub struct Session {
     connection: Option<Box<dyn Connection>>,
     connection_label: String,
     log: Vec<u8>,
+    /// FR-O3: when set, everything appended to `log` is also written here.
+    log_file: Option<LogFile>,
     ansi_filter: AnsiFilter,
     pub input: String,
     pub newline_mode: NewlineMode,
@@ -248,6 +257,7 @@ impl Session {
             connection: Some(connection),
             connection_label,
             log: Vec::new(),
+            log_file: None,
             ansi_filter: AnsiFilter::default(),
             input: String::new(),
             newline_mode,
@@ -260,11 +270,48 @@ impl Session {
         &self.connection_label
     }
 
+    pub fn log_path(&self) -> Option<&std::path::Path> {
+        self.log_file.as_ref().map(LogFile::path)
+    }
+
+    /// FR-O3: start mirroring the log to `file`, tagged with the connection
+    /// so appended sessions can be told apart.
+    pub fn set_log_file(&mut self, file: LogFile) {
+        self.log_file = Some(file);
+        let header = format!("# {}\n", self.connection_label);
+        self.write_log_file(header.as_bytes());
+    }
+
+    /// Start logging in the middle of a session. Only output from now on is
+    /// written; what is already on screen is not back-filled.
+    pub fn start_log(&mut self, file: LogFile) {
+        self.set_log_file(file);
+        self.status = "Logging started".to_string();
+    }
+
+    pub fn stop_log(&mut self) {
+        if self.log_file.take().is_some() {
+            self.status = "Logging stopped".to_string();
+        }
+    }
+
+    /// A write error stops logging (and says so in the status bar) but never
+    /// takes the connection down.
+    fn write_log_file(&mut self, data: &[u8]) {
+        if let Some(file) = self.log_file.as_mut()
+            && let Err(e) = file.write(data)
+        {
+            self.status = format!("Log write failed, logging stopped: {e}");
+            self.log_file = None;
+        }
+    }
+
     pub fn log_text(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.log)
     }
 
     fn append_log(&mut self, data: &[u8]) {
+        self.write_log_file(data);
         self.log.extend_from_slice(data);
         if self.log.len() > MAX_LOG_BYTES {
             let excess = self.log.len() - MAX_LOG_BYTES;
@@ -341,5 +388,65 @@ impl Session {
         }
         self.connected = false;
         self.status = "Disconnected".to_string();
+        self.log_file = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockConnection {
+        incoming: Vec<u8>,
+    }
+
+    impl Connection for MockConnection {
+        fn read_available(&mut self) -> std::io::Result<Vec<u8>> {
+            Ok(std::mem::take(&mut self.incoming))
+        }
+        fn write_all(&mut self, _data: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn describe(&self) -> String {
+            "mock".to_string()
+        }
+        fn close(&mut self) {}
+    }
+
+    #[test]
+    fn log_file_mirrors_output_and_sent_lines() {
+        let dir = std::env::temp_dir().join(format!("rtc-session-{}", std::process::id()));
+        let path = dir.join("session.log");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let conn = MockConnection { incoming: b"\x1b[32mhello\x1b[0m\r\n".to_vec() };
+        let mut session = Session::new(Box::new(conn), NewlineMode::Lf);
+        session.set_log_file(LogFile::open(path.to_str().unwrap()).unwrap());
+        session.poll_connection();
+        session.send_text("ls");
+        session.disconnect();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mock\nhello\nls\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_can_start_and_stop_mid_session() {
+        let dir = std::env::temp_dir().join(format!("rtc-midlog-{}", std::process::id()));
+        let path = dir.join("session.log");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let conn = MockConnection { incoming: Vec::new() };
+        let mut session = Session::new(Box::new(conn), NewlineMode::Lf);
+        session.send_text("before");
+        session.start_log(LogFile::open(path.to_str().unwrap()).unwrap());
+        assert!(session.log_path().is_some());
+        session.send_text("during");
+        session.stop_log();
+        assert!(session.log_path().is_none());
+        session.send_text("after");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mock\nduring\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,6 +4,7 @@ mod ansi;
 mod app;
 mod config;
 mod connection;
+mod logfile;
 mod serial;
 mod ssh;
 mod ui;
@@ -11,6 +12,7 @@ mod ui;
 use eframe::egui;
 
 use app::{ConnectForm, Session};
+use logfile::LogFile;
 use ui::{ConnectAction, HeaderAction};
 
 struct GuiApp {
@@ -41,13 +43,45 @@ impl GuiApp {
     /// first so a serial port it holds is free to reopen. On failure the
     /// error stays in the form and the panel stays open.
     fn connect(&mut self) {
+        // Open the log file before touching the current session so a bad
+        // path fails cleanly instead of dropping a live connection.
+        let log_file = if self.form.log_enabled {
+            match LogFile::open(&self.form.log_path) {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    self.form.error = Some(format!("{e:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         if let Some(session) = self.session.as_mut() {
             session.disconnect();
         }
         let newline = self.form.newline;
         if let Some(conn) = self.form.connect() {
-            self.session = Some(Session::new(conn, newline));
+            let mut session = Session::new(conn, newline);
+            if let Some(file) = log_file {
+                session.set_log_file(file);
+            }
+            self.session = Some(session);
             self.show_connect = false;
+        }
+    }
+}
+
+impl GuiApp {
+    /// Start logging the live session to the path in the form. A bad path is
+    /// reported in the header status and leaves the session untouched.
+    fn start_log(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        match LogFile::open(&self.form.log_path) {
+            Ok(file) => session.start_log(file),
+            Err(e) => session.status = format!("Log start failed: {e:#}"),
         }
     }
 }
@@ -58,10 +92,26 @@ impl eframe::App for GuiApp {
             session.poll_connection();
         }
 
-        if let HeaderAction::Disconnect = ui::draw_header(ui, self.session.as_mut(), &mut self.show_connect, &mut self.show_notebook)
-            && let Some(session) = self.session.as_mut()
-        {
-            session.disconnect();
+        let header_action = ui::draw_header(
+            ui,
+            self.session.as_mut(),
+            &mut self.show_connect,
+            &mut self.show_notebook,
+            &mut self.form.log_path,
+        );
+        match header_action {
+            HeaderAction::None => {}
+            HeaderAction::Disconnect => {
+                if let Some(session) = self.session.as_mut() {
+                    session.disconnect();
+                }
+            }
+            HeaderAction::StartLog => self.start_log(),
+            HeaderAction::StopLog => {
+                if let Some(session) = self.session.as_mut() {
+                    session.stop_log();
+                }
+            }
         }
 
         if self.show_connect
