@@ -1,13 +1,17 @@
 //! GUI rendering (FR-6, FR-7). The window is always the terminal (header +
 //! log + input); the connect form (FR-2, FR-3) is a left side panel toggled
 //! by the header's "Connection" button, and the notebook cells are a right
-//! side panel toggled from the header's "View" menu. Cells only send
-//! commands; their output lands in the shared log.
+//! side panel toggled from the header's "View" menu. Command cells send
+//! their text over the connection; output lands in the shared log, not the
+//! cell. Note cells are never sent — they hold Markdown documentation and
+//! are rendered inline. Both are saved/loaded together as an XML file.
 
 use eframe::egui::{self, Color32, ComboBox, RichText, ScrollArea, TextEdit};
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::app::{AuthMode, ConnMode, ConnectForm, Session};
 use crate::connection::NewlineMode;
+use crate::notebook::{Cell, CellKind};
 
 pub enum ConnectAction {
     None,
@@ -310,39 +314,92 @@ pub fn draw_header(
     action
 }
 
-/// Notebook cells, drawn as a right side panel. Call only while it is shown.
-///
-/// Returns the text of a cell whose Run button (or Shift+Enter) was hit; the
-/// caller sends it. `can_run` is false while there is no live connection.
-pub fn draw_notebook(ui: &mut egui::Ui, cells: &mut Vec<String>, can_run: bool) -> Option<String> {
-    let mut to_run = None;
+pub enum NotebookAction {
+    None,
+    /// A command cell's Run button (or Shift+Enter) was hit; the caller
+    /// sends this text over the connection.
+    Run(String),
+    /// Write `cells` to the path field as XML.
+    Save,
+    /// Replace `cells` with what the path field's XML file holds.
+    Load,
+}
 
-    egui::Panel::right("notebook_panel").default_size(340.0).show(ui, |ui| {
+/// Notebook cells, drawn as a right side panel. Call only while it is shown.
+/// `can_run` is false while there is no live connection.
+pub fn draw_notebook(
+    ui: &mut egui::Ui,
+    cells: &mut Vec<Cell>,
+    file_path: &mut String,
+    error: Option<&str>,
+    md_cache: &mut CommonMarkCache,
+    can_run: bool,
+) -> NotebookAction {
+    let mut action = NotebookAction::None;
+
+    egui::Panel::right("notebook_panel").default_size(360.0).show(ui, |ui| {
         ui.heading("Notebook");
-        ui.label("Run a cell to send it; output appears in the log.");
+        ui.label("Command cells send their text; note cells document and are never sent.");
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(file_path)
+                    .desired_width(ui.available_width() - 110.0)
+                    .hint_text("notebook.xml"),
+            );
+            if ui.button("Save").clicked() {
+                action = NotebookAction::Save;
+            }
+            if ui.button("Load").clicked() {
+                action = NotebookAction::Load;
+            }
+        });
+        if let Some(err) = error {
+            ui.colored_label(Color32::from_rgb(220, 60, 60), err);
+        }
         ui.separator();
 
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut remove = None;
             for (i, cell) in cells.iter_mut().enumerate() {
                 let id = ui.make_persistent_id(("notebook_cell", i));
-                let focused = ui.memory(|m| m.has_focus(id));
-                let shift_enter =
-                    focused && ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
 
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut cell.kind, CellKind::Command, "Command");
+                    ui.radio_value(&mut cell.kind, CellKind::Note, "Note");
+                });
+
+                let focused = ui.memory(|m| m.has_focus(id));
+                let shift_enter = focused
+                    && cell.kind == CellKind::Command
+                    && ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter));
+
+                let hint = match cell.kind {
+                    CellKind::Command => "Command (Shift+Enter to run)",
+                    CellKind::Note => "Note (Markdown, never sent)",
+                };
                 ui.add(
-                    TextEdit::multiline(cell)
+                    TextEdit::multiline(&mut cell.text)
                         .id(id)
                         .code_editor()
                         .desired_rows(2)
                         .desired_width(f32::INFINITY)
-                        .hint_text("Command (Shift+Enter to run)"),
+                        .hint_text(hint),
                 );
 
+                if cell.kind == CellKind::Note && !cell.text.trim().is_empty() {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        CommonMarkViewer::new().show(ui, md_cache, &cell.text);
+                    });
+                }
+
                 ui.horizontal(|ui| {
-                    let run_clicked = ui.add_enabled(can_run, egui::Button::new("Run")).clicked();
-                    if (run_clicked || (shift_enter && can_run)) && !cell.trim().is_empty() {
-                        to_run = Some(cell.clone());
+                    if cell.kind == CellKind::Command {
+                        let run_clicked = ui.add_enabled(can_run, egui::Button::new("Run")).clicked();
+                        if (run_clicked || (shift_enter && can_run)) && !cell.text.trim().is_empty() {
+                            action = NotebookAction::Run(cell.text.clone());
+                        }
                     }
                     if ui.button("Delete").clicked() {
                         remove = Some(i);
@@ -354,13 +411,18 @@ pub fn draw_notebook(ui: &mut egui::Ui, cells: &mut Vec<String>, can_run: bool) 
                 cells.remove(i);
             }
 
-            if ui.button("+ Add cell").clicked() {
-                cells.push(String::new());
-            }
+            ui.horizontal(|ui| {
+                if ui.button("+ Command cell").clicked() {
+                    cells.push(Cell::command());
+                }
+                if ui.button("+ Note cell").clicked() {
+                    cells.push(Cell { kind: CellKind::Note, text: String::new() });
+                }
+            });
         });
     });
 
-    to_run
+    action
 }
 
 /// Input bar and scrolling log. `session` is `None` until the first connect.

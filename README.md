@@ -20,14 +20,25 @@ cargo build --release
 Binary lands at `target/release/rust-term-console` (`.exe` on Windows). Run
 it directly — no command-line arguments needed; a window opens with the
 connect panel already open. Use the **Connection** button in the header to
-show or hide it. **View → Notebook** opens a right-hand panel of command
-cells: type a command, press **Run** (or Shift+Enter) and it is sent over
-the current connection. The command and its output appear in the main log,
-not in the cell. Tick **Save session log to file** in the connect panel and
+show or hide it. Tick **Save session log to file** in the connect panel and
 give a path (`~/` is expanded, missing folders are created) to also append
 the log to a file; a `● LOG` marker in the header shows it is active. Logging
 can also be started or stopped while connected from the header's **Log**
 menu (only output from that point on is written).
+
+**View → Notebook** opens a right-hand panel of cells, each either:
+
+- a **Command** cell — press **Run** (or Shift+Enter) and its text is sent
+  over the current connection, the same as typing it in the input bar. The
+  command and its output appear in the main log, never in the cell.
+- a **Note** cell — Markdown documentation for the commands around it
+  (headings, lists, bold/italic, code spans, …); it is rendered inline below
+  what you type and is never sent anywhere.
+
+Use **+ Command cell** / **+ Note cell** to add either kind, and **Delete**
+to remove one. **Save**/**Load** at the top of the panel write/read the
+whole cell list as an XML file (path field to the left of the buttons);
+loading replaces the current cells.
 
 ## Using the app
 
@@ -73,10 +84,14 @@ menu (only output from that point on is written).
 - `app.rs` holds `ConnectForm` (the dialog's fields and profile
   load/save/connect logic) and `Session` (log buffer capped at 2 MB, input
   line, connection status) — both transport-agnostic.
+- `notebook.rs` defines `Cell`/`CellKind` (Command vs Note) and their
+  XML `save`/`load`, independent of the UI.
 - `ui.rs` is pure `egui` rendering: `draw_header`, `draw_connect` (a left
-  side panel), `draw_notebook` (a right side panel) and `draw_terminal` take the current
-  state and an `egui::Ui`, and report back what the user did (`HeaderAction` /
-  `ConnectAction`) rather than mutating app state themselves.
+  side panel), `draw_notebook` (a right side panel, using `egui_commonmark`
+  to render Note cells) and `draw_terminal` take the current state and an
+  `egui::Ui`, and report back what the user did (`HeaderAction` /
+  `ConnectAction` / `NotebookAction`) rather than mutating app state
+  themselves.
 - `main.rs` implements `eframe::App`: it owns the form, the optional
   `Session` and the panel's open/closed flag, and acts on those actions
   (opening the connection, disconnecting).
@@ -99,6 +114,8 @@ Matches the spec's phased roadmap — not yet implemented:
 
 - Session log formats other than plain text, and per-line timestamps
   (FR-O3 is plain text only).
+- Notebook cells run one at a time; no "Run all", no per-cell output, and
+  no command history recall in the input bar.
 - Multiple concurrent connections / tabs (FR-O2).
 - Telnet transport (FR-O1 covers SSH only so far).
 - Remote PTY resize when the window is resized (SSH channel size is fixed
