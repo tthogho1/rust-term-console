@@ -5,15 +5,18 @@ mod app;
 mod config;
 mod connection;
 mod logfile;
+mod notebook;
 mod serial;
 mod ssh;
 mod ui;
 
 use eframe::egui;
+use egui_commonmark::CommonMarkCache;
 
 use app::{ConnectForm, Session};
 use logfile::LogFile;
-use ui::{ConnectAction, HeaderAction};
+use notebook::Cell;
+use ui::{ConnectAction, HeaderAction, NotebookAction};
 
 struct GuiApp {
     form: ConnectForm,
@@ -21,9 +24,16 @@ struct GuiApp {
     /// Whether the connect side panel is open. Starts open so the first
     /// thing the user sees is how to connect.
     show_connect: bool,
-    /// Notebook cells (command text only) and whether their panel is open.
-    cells: Vec<String>,
+    /// Notebook cells and whether their panel is open.
+    cells: Vec<Cell>,
     show_notebook: bool,
+    /// Path used by the notebook panel's Save/Load buttons.
+    notebook_path: String,
+    /// Set when a Save/Load in the notebook panel fails; cleared on success.
+    notebook_error: Option<String>,
+    /// Rendered-Markdown cache for note cells; kept across frames so the
+    /// panel doesn't reparse every cell every repaint.
+    md_cache: CommonMarkCache,
 }
 
 impl Default for GuiApp {
@@ -32,8 +42,11 @@ impl Default for GuiApp {
             form: ConnectForm::default(),
             session: None,
             show_connect: true,
-            cells: vec![String::new()],
+            cells: vec![Cell::command()],
             show_notebook: false,
+            notebook_path: String::new(),
+            notebook_error: None,
+            md_cache: CommonMarkCache::default(),
         }
     }
 }
@@ -122,10 +135,32 @@ impl eframe::App for GuiApp {
 
         if self.show_notebook {
             let can_run = self.session.as_ref().is_some_and(|s| s.connected);
-            if let Some(text) = ui::draw_notebook(ui, &mut self.cells, can_run)
-                && let Some(session) = self.session.as_mut()
-            {
-                session.send_text(&text);
+            let action = ui::draw_notebook(
+                ui,
+                &mut self.cells,
+                &mut self.notebook_path,
+                self.notebook_error.as_deref(),
+                &mut self.md_cache,
+                can_run,
+            );
+            match action {
+                NotebookAction::None => {}
+                NotebookAction::Run(text) => {
+                    if let Some(session) = self.session.as_mut() {
+                        session.send_text(&text);
+                    }
+                }
+                NotebookAction::Save => match notebook::save(&self.notebook_path, &self.cells) {
+                    Ok(()) => self.notebook_error = None,
+                    Err(e) => self.notebook_error = Some(format!("{e:#}")),
+                },
+                NotebookAction::Load => match notebook::load(&self.notebook_path) {
+                    Ok(cells) => {
+                        self.cells = cells;
+                        self.notebook_error = None;
+                    }
+                    Err(e) => self.notebook_error = Some(format!("{e:#}")),
+                },
             }
         }
 
