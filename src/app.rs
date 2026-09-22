@@ -14,6 +14,9 @@ use crate::ssh::{SshAuth, SshConfig, SshConnection};
 /// Cap on retained output so long-running sessions stay bounded (NFR-4).
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
 
+/// Cap on remembered command-history entries.
+const MAX_HISTORY: usize = 500;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnMode {
     Serial,
@@ -245,6 +248,15 @@ pub struct Session {
     log_file: Option<LogFile>,
     ansi_filter: AnsiFilter,
     pub input: String,
+    /// Lines previously sent, oldest first (from the input bar and from
+    /// notebook cells), for Up/Down recall in the input bar.
+    history: Vec<String>,
+    /// Position in `history` while recalling with Up/Down; `None` means the
+    /// input bar holds a fresh line, not a recalled one.
+    history_index: Option<usize>,
+    /// What was in the input bar before the first Up press, restored when
+    /// Down is pressed past the most recent history entry.
+    history_draft: String,
     pub newline_mode: NewlineMode,
     pub status: String,
     pub connected: bool,
@@ -260,6 +272,9 @@ impl Session {
             log_file: None,
             ansi_filter: AnsiFilter::default(),
             input: String::new(),
+            history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             newline_mode,
             status: "Connected".to_string(),
             connected: true,
@@ -360,6 +375,8 @@ impl Session {
             return;
         }
         for line in text.lines() {
+            self.record_history(line);
+
             let mut payload = line.as_bytes().to_vec();
             payload.extend_from_slice(self.newline_mode.as_bytes());
 
@@ -378,6 +395,54 @@ impl Session {
                 }
                 return;
             }
+        }
+    }
+
+    /// Remember `line` for Up/Down recall, skipping blanks and immediate
+    /// repeats (like typical shell history). Also ends any in-progress
+    /// recall, since the input bar just sent something new.
+    fn record_history(&mut self, line: &str) {
+        self.history_index = None;
+        self.history_draft.clear();
+        if line.is_empty() || self.history.last().is_some_and(|last| last == line) {
+            return;
+        }
+        self.history.push(line.to_string());
+        if self.history.len() > MAX_HISTORY {
+            self.history.remove(0);
+        }
+    }
+
+    /// Recall an older history entry into `input` (Up). The first call
+    /// stashes whatever was already typed so Down can restore it later.
+    pub fn history_prev(&mut self) {
+        let new_index = match self.history_index {
+            None => {
+                if self.history.is_empty() {
+                    return;
+                }
+                self.history_draft = std::mem::take(&mut self.input);
+                self.history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(new_index);
+        self.input = self.history[new_index].clone();
+    }
+
+    /// Recall a newer history entry into `input` (Down), or restore the
+    /// pre-recall draft once past the most recent entry.
+    pub fn history_next(&mut self) {
+        let Some(i) = self.history_index else {
+            return;
+        };
+        if i + 1 < self.history.len() {
+            self.history_index = Some(i + 1);
+            self.input = self.history[i + 1].clone();
+        } else {
+            self.history_index = None;
+            self.input = std::mem::take(&mut self.history_draft);
         }
     }
 
@@ -448,5 +513,68 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mock\nduring\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mock_session() -> Session {
+        Session::new(Box::new(MockConnection { incoming: Vec::new() }), NewlineMode::Lf)
+    }
+
+    #[test]
+    fn history_up_and_down_recall_sent_lines_in_order() {
+        let mut session = mock_session();
+        session.send_text("first");
+        session.send_text("second");
+
+        session.history_prev();
+        assert_eq!(session.input, "second");
+        session.history_prev();
+        assert_eq!(session.input, "first");
+        // Oldest entry: further Up stays put rather than wrapping.
+        session.history_prev();
+        assert_eq!(session.input, "first");
+
+        session.history_next();
+        assert_eq!(session.input, "second");
+    }
+
+    #[test]
+    fn history_down_past_newest_restores_the_unsent_draft() {
+        let mut session = mock_session();
+        session.send_text("ls");
+        session.input = "unsent draft".to_string();
+
+        session.history_prev();
+        assert_eq!(session.input, "ls");
+        session.history_next();
+        assert_eq!(session.input, "unsent draft");
+    }
+
+    #[test]
+    fn history_skips_blank_lines_and_immediate_repeats() {
+        let mut session = mock_session();
+        session.send_text("ls");
+        session.send_text("ls");
+        session.send_text("");
+
+        session.history_prev();
+        assert_eq!(session.input, "ls");
+        // Only one "ls" was recorded, so a second Up has nowhere further to go.
+        session.history_prev();
+        assert_eq!(session.input, "ls");
+    }
+
+    #[test]
+    fn sending_a_new_line_ends_an_in_progress_recall() {
+        let mut session = mock_session();
+        session.send_text("first");
+        session.history_prev();
+        assert_eq!(session.input, "first");
+
+        session.input = "second".to_string();
+        session.send_current_input();
+
+        // No stale draft or recall position left over from before the send.
+        session.history_prev();
+        assert_eq!(session.input, "second");
     }
 }

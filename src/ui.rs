@@ -434,7 +434,7 @@ pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
                     session.connected,
                     TextEdit::singleline(&mut session.input)
                         .desired_width(ui.available_width() - 70.0)
-                        .hint_text("Type and press Enter to send"),
+                        .hint_text("Type and press Enter to send (\u{2191}/\u{2193} for history)"),
                 );
                 let send_clicked = ui.add_enabled(session.connected, egui::Button::new("Send")).clicked();
 
@@ -444,6 +444,24 @@ pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
                     response.request_focus();
                 } else if session.connected && ui.memory(|m| m.focused().is_none()) {
                     response.request_focus();
+                } else if session.connected && response.has_focus() {
+                    let (up, down) = ui.input(|i| {
+                        (i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown))
+                    });
+                    if up || down {
+                        if up {
+                            session.history_prev();
+                        } else {
+                            session.history_next();
+                        }
+                        // Recalled text replaces the line; put the cursor at
+                        // its end rather than wherever it happened to be.
+                        if let Some(mut state) = TextEdit::load_state(ui.ctx(), response.id) {
+                            let end = egui::text::CCursor::new(session.input.chars().count());
+                            state.cursor.set_char_range(Some(egui::text_selection::CCursorRange::one(end)));
+                            TextEdit::store_state(ui.ctx(), response.id, state);
+                        }
+                    }
                 }
             }
             None => {

@@ -68,6 +68,9 @@ loading replaces the current cells.
 - Log area: scrollable, auto-follows new output, monospaced.
 - Input bar: type and press Enter (or click Send) to transmit a line; local
   echo shows what you sent even if the remote doesn't echo it back.
+  **↑/↓** recall previously sent lines (from the input bar or a notebook
+  cell), most recent first; ↓ past the most recent restores whatever you
+  had typed before you started recalling.
 - **Disconnect** closes the connection cleanly and returns to the connect
   screen; closing the window does the same via the OS.
 
@@ -83,7 +86,8 @@ loading replaces the current cells.
   the same poll-driven reads.
 - `app.rs` holds `ConnectForm` (the dialog's fields and profile
   load/save/connect logic) and `Session` (log buffer capped at 2 MB, input
-  line, connection status) — both transport-agnostic.
+  line, sent-line history capped at 500 entries, connection status) — both
+  transport-agnostic.
 - `notebook.rs` defines `Cell`/`CellKind` (Command vs Note) and their
   XML `save`/`load`, independent of the UI.
 - `ui.rs` is pure `egui` rendering: `draw_header`, `draw_connect` (a left
@@ -114,8 +118,7 @@ Matches the spec's phased roadmap — not yet implemented:
 
 - Session log formats other than plain text, and per-line timestamps
   (FR-O3 is plain text only).
-- Notebook cells run one at a time; no "Run all", no per-cell output, and
-  no command history recall in the input bar.
+- Notebook cells run one at a time; no "Run all" and no per-cell output.
 - Multiple concurrent connections / tabs (FR-O2).
 - Telnet transport (FR-O1 covers SSH only so far).
 - Remote PTY resize when the window is resized (SSH channel size is fixed
