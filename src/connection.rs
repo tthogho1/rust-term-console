@@ -18,6 +18,13 @@ pub trait Connection {
     /// "user@host:22".
     fn describe(&self) -> String;
 
+    /// Tell the remote the terminal is now `cols` x `rows` characters, so
+    /// full-width output (`ls`, `top`, prompts) wraps where the window does.
+    /// Transports without a terminal size (serial) ignore it.
+    fn resize(&mut self, _cols: u32, _rows: u32) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Best-effort clean shutdown. Errors are logged, not propagated.
     fn close(&mut self);
 }
@@ -48,6 +55,43 @@ impl NewlineMode {
     }
 
     pub const ALL: [NewlineMode; 3] = [NewlineMode::CrLf, NewlineMode::Lf, NewlineMode::None];
+}
+
+/// A key sent as its raw control byte rather than as a typed line: lets the
+/// user interrupt a running command, end input, suspend, complete or escape
+/// on the remote side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlKey {
+    CtrlC,
+    CtrlD,
+    CtrlZ,
+    Tab,
+    Esc,
+}
+
+impl ControlKey {
+    pub fn byte(self) -> u8 {
+        match self {
+            ControlKey::CtrlC => 0x03,
+            ControlKey::CtrlD => 0x04,
+            ControlKey::CtrlZ => 0x1a,
+            ControlKey::Tab => b'\t',
+            ControlKey::Esc => 0x1b,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ControlKey::CtrlC => "Ctrl+C (interrupt)",
+            ControlKey::CtrlD => "Ctrl+D (end of input)",
+            ControlKey::CtrlZ => "Ctrl+Z (suspend)",
+            ControlKey::Tab => "Tab (complete)",
+            ControlKey::Esc => "Esc",
+        }
+    }
+
+    pub const ALL: [ControlKey; 5] =
+        [ControlKey::CtrlC, ControlKey::CtrlD, ControlKey::CtrlZ, ControlKey::Tab, ControlKey::Esc];
 }
 
 impl std::str::FromStr for NewlineMode {

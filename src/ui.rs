@@ -10,7 +10,7 @@ use eframe::egui::{self, Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::app::{AuthMode, ConnMode, ConnectForm, Session};
-use crate::connection::NewlineMode;
+use crate::connection::{ControlKey, NewlineMode};
 use crate::notebook::{Cell, CellKind};
 
 pub enum ConnectAction {
@@ -69,6 +69,7 @@ fn draw_connect_form(ui: &mut egui::Ui, form: &mut ConnectForm, action: &mut Con
     });
 
     ui.add_space(8.0);
+    ui.checkbox(&mut form.timestamps, "Timestamp each line");
     ui.checkbox(&mut form.log_enabled, "Save session log to file");
     if form.log_enabled {
         ui.add(
@@ -228,6 +229,7 @@ pub fn draw_header(
     session: Option<&mut Session>,
     show_connect: &mut bool,
     show_notebook: &mut bool,
+    timestamps: &mut bool,
     log_path: &mut String,
 ) -> HeaderAction {
     let mut action = HeaderAction::None;
@@ -239,6 +241,8 @@ pub fn draw_header(
             }
             ui.menu_button("View", |ui| {
                 ui.checkbox(show_notebook, "Notebook");
+                ui.checkbox(timestamps, "Timestamps")
+                    .on_hover_text("Prefix each new line with the local time, in the view and the log file");
             });
 
             let connected = session.as_ref().is_some_and(|s| s.connected);
@@ -425,21 +429,109 @@ pub fn draw_notebook(
     action
 }
 
+/// Pull a Ctrl+C/D/Z press for the focused input bar out of this frame's
+/// events, so the text box never sees it (Ctrl+Z would otherwise be undo on
+/// Windows/Linux). Windows/Linux deliver Ctrl+C as a Copy event instead of a
+/// key press; it counts as an interrupt only when nothing is selected, so
+/// copying selected text still works. On macOS copy is Cmd+C and Ctrl+C
+/// arrives as a plain key press.
+fn take_control_shortcut(ui: &mut egui::Ui, input_id: egui::Id) -> Option<ControlKey> {
+    let has_selection = TextEdit::load_state(ui.ctx(), input_id)
+        .and_then(|state| state.cursor.char_range())
+        .is_some_and(|range| !range.is_empty());
+
+    ui.input_mut(|input| {
+        let mut found = None;
+        input.events.retain(|event| {
+            let key = match event {
+                egui::Event::Key { key, pressed: true, modifiers, .. }
+                    if modifiers.ctrl && !modifiers.shift && !modifiers.alt && !modifiers.mac_cmd =>
+                {
+                    match key {
+                        egui::Key::C => ControlKey::CtrlC,
+                        egui::Key::D => ControlKey::CtrlD,
+                        egui::Key::Z => ControlKey::CtrlZ,
+                        _ => return true,
+                    }
+                }
+                egui::Event::Copy if cfg!(not(target_os = "macos")) && !has_selection => ControlKey::CtrlC,
+                _ => return true,
+            };
+            found = Some(key);
+            false
+        });
+        found
+    })
+}
+
+/// How many monospace characters fit across and down the log area, leaving
+/// room for the vertical scroll bar.
+fn log_area_size_in_chars(ui: &egui::Ui) -> (u32, u32) {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let (char_width, row_height) =
+        ui.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
+    let scroll = &ui.style().spacing.scroll;
+    let width = ui.available_width() - scroll.bar_width - scroll.bar_outer_margin - scroll.bar_inner_margin;
+    let height = ui.available_height();
+    let cols = (width / char_width.max(1.0)).floor().max(1.0) as u32;
+    let rows = (height / row_height.max(1.0)).floor().max(1.0) as u32;
+    (cols, rows)
+}
+
 /// Input bar and scrolling log. `session` is `None` until the first connect.
 pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
     egui::Panel::bottom("input_bar").show(ui, |ui| {
         ui.horizontal(|ui| match session.as_deref_mut() {
             Some(session) => {
+                let input_id = ui.make_persistent_id("terminal_input");
+                let mut control = None;
+                if session.connected && ui.memory(|m| m.has_focus(input_id)) {
+                    control = take_control_shortcut(ui, input_id);
+                }
+
                 let response = ui.add_enabled(
                     session.connected,
                     TextEdit::singleline(&mut session.input)
-                        .desired_width(ui.available_width() - 70.0)
+                        .id(input_id)
+                        // Keep focus on Tab so it can be sent for completion.
+                        .lock_focus(true)
+                        .desired_width(ui.available_width() - 150.0)
                         .hint_text("Type and press Enter to send (\u{2191}/\u{2193} for history)"),
                 );
                 let send_clicked = ui.add_enabled(session.connected, egui::Button::new("Send")).clicked();
+                if ui
+                    .add_enabled(session.connected, egui::Button::new("^C"))
+                    .on_hover_text(ControlKey::CtrlC.label())
+                    .clicked()
+                {
+                    control = Some(ControlKey::CtrlC);
+                }
+                ui.add_enabled_ui(session.connected, |ui| {
+                    ui.menu_button("Keys", |ui| {
+                        for key in ControlKey::ALL {
+                            if ui.button(key.label()).clicked() {
+                                control = Some(key);
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+
+                // egui drops focus on Esc before the widget runs, so (like
+                // Enter) it shows up as the input bar losing focus.
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    control = Some(ControlKey::Esc);
+                } else if response.has_focus()
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+                {
+                    control = Some(ControlKey::Tab);
+                }
 
                 let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if session.connected && (enter_pressed || send_clicked) {
+                if let Some(key) = control.filter(|_| session.connected) {
+                    session.send_control(key);
+                    response.request_focus();
+                } else if session.connected && (enter_pressed || send_clicked) {
                     session.send_current_input();
                     response.request_focus();
                 } else if session.connected && ui.memory(|m| m.focused().is_none()) {
@@ -468,15 +560,23 @@ pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
                 ui.add_enabled(
                     false,
                     TextEdit::singleline(&mut String::new())
-                        .desired_width(ui.available_width() - 70.0)
+                        .desired_width(ui.available_width() - 150.0)
                         .hint_text("Not connected"),
                 );
                 ui.add_enabled(false, egui::Button::new("Send"));
+                ui.add_enabled(false, egui::Button::new("^C"));
+                ui.add_enabled(false, egui::Button::new("Keys"));
             }
         });
     });
 
     egui::CentralPanel::default().show(ui, |ui| {
+        if let Some(session) = session.as_deref_mut()
+            && session.connected
+        {
+            let (cols, rows) = log_area_size_in_chars(ui);
+            session.request_resize(cols, rows, std::time::Instant::now());
+        }
         ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
             if let Some(session) = session.as_deref() {
                 ui.add(egui::Label::new(RichText::new(session.log_text()).monospace()).wrap().selectable(true));

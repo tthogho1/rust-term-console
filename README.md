@@ -26,6 +26,12 @@ the log to a file; a `● LOG` marker in the header shows it is active. Logging
 can also be started or stopped while connected from the header's **Log**
 menu (only output from that point on is written).
 
+Tick **Timestamp each line** in the connect panel (or **View →
+Timestamps** at any time) to prefix each new line with the local time,
+e.g. `[14:03:27.512] `, in both the log view and the log file. A line is
+stamped when its first byte arrives; turning it on mid-line starts at the
+next line.
+
 **View → Notebook** opens a right-hand panel of cells, each either:
 
 - a **Command** cell — press **Run** (or Shift+Enter) and its text is sent
@@ -71,6 +77,15 @@ loading replaces the current cells.
   **↑/↓** recall previously sent lines (from the input bar or a notebook
   cell), most recent first; ↓ past the most recent restores whatever you
   had typed before you started recalling.
+- **Control keys**: with the input bar focused, **Ctrl+C** (interrupt),
+  **Ctrl+D** (end of input), **Ctrl+Z** (suspend) and **Esc** are sent to
+  the remote as their raw byte, no newline — so you can stop a running
+  `ping`/`tail -f` without disconnecting. **Tab** sends what you've typed
+  so far plus a Tab for remote completion, then clears the input bar;
+  keep typing the rest of the line and press Enter. The **^C** button and
+  **Keys** menu next to Send do the same by mouse. On Windows/Linux,
+  Ctrl+C copies instead when text in the input bar is selected (on macOS
+  copy is Cmd+C, so Ctrl+C is always an interrupt).
 - **Disconnect** closes the connection cleanly and returns to the connect
   screen; closing the window does the same via the OS.
 
@@ -78,7 +93,13 @@ loading replaces the current cells.
 
 - `connection.rs` defines the `Connection` trait (`read_available`,
   `write_all`, `describe`, `close`) that both transports implement, plus
-  `NewlineMode`.
+  `NewlineMode` and `ControlKey` (the raw bytes behind Ctrl+C/D/Z, Tab,
+  Esc).
+- Remote terminal size follows the window: each frame the log area's size
+  is measured in monospace characters, and once it has held still for
+  200 ms `Session` sends it via `Connection::resize` (SSH
+  `request_pty_size`; a no-op on serial). So `ls`, `top`, long prompts etc.
+  wrap at the window's width rather than a fixed 120 columns.
 - `serial.rs` wraps `serialport` with a short read timeout so polling never
   blocks the UI thread.
 - `ssh.rs` wraps `ssh2`: TCP connect → handshake → password/key/agent auth →
@@ -88,6 +109,9 @@ loading replaces the current cells.
   load/save/connect logic) and `Session` (log buffer capped at 2 MB, input
   line, sent-line history capped at 500 entries, connection status) — both
   transport-agnostic.
+- `timestamp.rs` holds `LineStamper`, which inserts the time stamp before
+  each line's first byte and tracks line position across reads; `Session`
+  runs everything it logs through it.
 - `notebook.rs` defines `Cell`/`CellKind` (Command vs Note) and their
   XML `save`/`load`, independent of the UI.
 - `ui.rs` is pure `egui` rendering: `draw_header`, `draw_connect` (a left
@@ -116,13 +140,10 @@ loading replaces the current cells.
 
 Matches the spec's phased roadmap — not yet implemented:
 
-- Session log formats other than plain text, and per-line timestamps
-  (FR-O3 is plain text only).
+- Session log formats other than plain text (FR-O3 is plain text only).
 - Notebook cells run one at a time; no "Run all" and no per-cell output.
 - Multiple concurrent connections / tabs (FR-O2).
 - Telnet transport (FR-O1 covers SSH only so far).
-- Remote PTY resize when the window is resized (SSH channel size is fixed
-  at connect time).
 - Full-screen interactive programs over the connection (vim, htop, less,
   etc.) won't render correctly — the log is plain text, not a real
   cursor-addressed terminal grid.

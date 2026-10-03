@@ -140,6 +140,24 @@ impl Connection for SshConnection {
         }
     }
 
+    fn resize(&mut self, cols: u32, rows: u32) -> io::Result<()> {
+        // Non-blocking session: retry on WouldBlock, as `write_all` does.
+        let mut spins = 0;
+        loop {
+            match self.channel.request_pty_size(cols, rows, None, None).map_err(io::Error::from) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    spins += 1;
+                    if spins > 2000 {
+                        return Err(io::Error::new(ErrorKind::TimedOut, "SSH resize timed out"));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     fn describe(&self) -> String {
         self.target.clone()
     }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dirs = "7.0.0"
 eframe = "0.35.0"
 egui_commonmark = { version = "0.24.0", default-features = false, features = ["pulldown_cmark"] }

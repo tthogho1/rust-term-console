@@ -8,6 +8,7 @@ mod logfile;
 mod notebook;
 mod serial;
 mod ssh;
+mod timestamp;
 mod ui;
 
 use eframe::egui;
@@ -76,6 +77,7 @@ impl GuiApp {
         let newline = self.form.newline;
         if let Some(conn) = self.form.connect() {
             let mut session = Session::new(conn, newline);
+            session.timestamps = self.form.timestamps;
             if let Some(file) = log_file {
                 session.set_log_file(file);
             }
@@ -102,7 +104,9 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if let Some(session) = self.session.as_mut() {
+            session.timestamps = self.form.timestamps;
             session.poll_connection();
+            session.flush_resize(std::time::Instant::now());
         }
 
         let header_action = ui::draw_header(
@@ -110,6 +114,7 @@ impl eframe::App for GuiApp {
             self.session.as_mut(),
             &mut self.show_connect,
             &mut self.show_notebook,
+            &mut self.form.timestamps,
             &mut self.form.log_path,
         );
         match header_action {

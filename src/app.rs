@@ -3,18 +3,24 @@
 //! (log buffer, input line, connection).
 
 use std::borrow::Cow;
+use std::time::{Duration, Instant};
 
 use crate::ansi::AnsiFilter;
 use crate::config::{self, Profile};
-use crate::connection::{Connection, NewlineMode};
+use crate::connection::{Connection, ControlKey, NewlineMode};
 use crate::logfile::LogFile;
 use crate::serial::{self, SerialConfig};
 use crate::ssh::{SshAuth, SshConfig, SshConnection};
+use crate::timestamp::{self, LineStamper};
 
 /// Cap on retained output so long-running sessions stay bounded (NFR-4).
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
 
 /// Cap on remembered command-history entries.
+/// How long the window size must hold still before the remote is told, so
+/// dragging a window edge sends one resize rather than one per frame.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
+
 const MAX_HISTORY: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +63,8 @@ pub struct ConnectForm {
     // Session logging (FR-O3).
     pub log_enabled: bool,
     pub log_path: String,
+    /// Stamp each line of output with the local time (view and log file).
+    pub timestamps: bool,
 
     // Profiles (FR-O4).
     pub available_profiles: Vec<String>,
@@ -85,6 +93,7 @@ impl Default for ConnectForm {
             newline: NewlineMode::CrLf,
             log_enabled: false,
             log_path: String::new(),
+            timestamps: false,
             available_profiles: config::list_profiles().unwrap_or_default(),
             profile_name: String::new(),
             error: None,
@@ -247,6 +256,9 @@ pub struct Session {
     /// FR-O3: when set, everything appended to `log` is also written here.
     log_file: Option<LogFile>,
     ansi_filter: AnsiFilter,
+    stamper: LineStamper,
+    /// Stamp each new line (output and local echo) with the local time.
+    pub timestamps: bool,
     pub input: String,
     /// Lines previously sent, oldest first (from the input bar and from
     /// notebook cells), for Up/Down recall in the input bar.
@@ -260,6 +272,10 @@ pub struct Session {
     pub newline_mode: NewlineMode,
     pub status: String,
     pub connected: bool,
+    /// Terminal size (cols, rows) last sent to the remote, if any.
+    term_size: Option<(u32, u32)>,
+    /// Latest size seen in the window and when it was first seen.
+    pending_size: Option<((u32, u32), Instant)>,
 }
 
 impl Session {
@@ -271,6 +287,8 @@ impl Session {
             log: Vec::new(),
             log_file: None,
             ansi_filter: AnsiFilter::default(),
+            stamper: LineStamper::default(),
+            timestamps: false,
             input: String::new(),
             history: Vec::new(),
             history_index: None,
@@ -278,6 +296,8 @@ impl Session {
             newline_mode,
             status: "Connected".to_string(),
             connected: true,
+            term_size: None,
+            pending_size: None,
         }
     }
 
@@ -326,8 +346,10 @@ impl Session {
     }
 
     fn append_log(&mut self, data: &[u8]) {
-        self.write_log_file(data);
-        self.log.extend_from_slice(data);
+        let stamp = self.timestamps.then(timestamp::now);
+        let data = self.stamper.apply(data, stamp.as_deref());
+        self.write_log_file(&data);
+        self.log.extend_from_slice(&data);
         if self.log.len() > MAX_LOG_BYTES {
             let excess = self.log.len() - MAX_LOG_BYTES;
             self.log.drain(0..excess);
@@ -354,6 +376,40 @@ impl Session {
                     conn.close();
                 }
             }
+        }
+    }
+
+    /// Note the log area's current size in characters. It is sent to the
+    /// remote by `flush_resize` once it has been stable for a moment.
+    pub fn request_resize(&mut self, cols: u32, rows: u32, now: Instant) {
+        let size = (cols.max(1), rows.max(1));
+        match self.pending_size {
+            Some((pending, _)) if pending == size => {}
+            _ if self.pending_size.is_none() && self.term_size == Some(size) => {}
+            _ => self.pending_size = Some((size, now)),
+        }
+    }
+
+    /// Send a pending size once it has held for `RESIZE_DEBOUNCE`. A failed
+    /// resize is reported but doesn't drop the connection — a real link
+    /// failure is caught by the next read.
+    pub fn flush_resize(&mut self, now: Instant) {
+        let Some((size, since)) = self.pending_size else {
+            return;
+        };
+        if now.duration_since(since) < RESIZE_DEBOUNCE {
+            return;
+        }
+        self.pending_size = None;
+        if self.term_size == Some(size) {
+            return;
+        }
+        let Some(conn) = self.connection.as_mut() else {
+            return;
+        };
+        match conn.resize(size.0, size.1) {
+            Ok(()) => self.term_size = Some(size),
+            Err(e) => self.status = format!("Resize failed: {e}"),
         }
     }
 
@@ -394,6 +450,36 @@ impl Session {
                     conn.close();
                 }
                 return;
+            }
+        }
+    }
+
+    /// Send `key` as its raw byte, with no newline. Tab first sends whatever
+    /// is typed in the input bar (and clears it) so the remote shell can
+    /// complete it; the rest of the line is then typed and sent as usual.
+    /// The other keys leave the input bar alone and are not echoed locally —
+    /// the remote shows its own `^C` etc. if it wants to.
+    pub fn send_control(&mut self, key: ControlKey) {
+        if !self.connected {
+            return;
+        }
+        let mut payload = Vec::new();
+        if key == ControlKey::Tab {
+            let partial = std::mem::take(&mut self.input);
+            self.history_index = None;
+            self.history_draft.clear();
+            self.append_log(partial.as_bytes());
+            payload.extend_from_slice(partial.as_bytes());
+        }
+        payload.push(key.byte());
+
+        if let Some(conn) = self.connection.as_mut()
+            && let Err(e) = conn.write_all(&payload)
+        {
+            self.status = format!("Send failed: {e}");
+            self.connected = false;
+            if let Some(mut conn) = self.connection.take() {
+                conn.close();
             }
         }
     }
@@ -576,5 +662,173 @@ mod tests {
         // No stale draft or recall position left over from before the send.
         session.history_prev();
         assert_eq!(session.input, "second");
+    }
+
+    /// Records everything written so tests can check the exact bytes sent.
+    struct RecordingConnection {
+        sent: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    }
+
+    impl Connection for RecordingConnection {
+        fn read_available(&mut self) -> std::io::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+            self.sent.borrow_mut().extend_from_slice(data);
+            Ok(())
+        }
+        fn describe(&self) -> String {
+            "recording".to_string()
+        }
+        fn close(&mut self) {}
+    }
+
+    fn recording_session() -> (Session, std::rc::Rc<std::cell::RefCell<Vec<u8>>>) {
+        let sent = std::rc::Rc::default();
+        let conn = RecordingConnection { sent: std::rc::Rc::clone(&sent) };
+        (Session::new(Box::new(conn), NewlineMode::CrLf), sent)
+    }
+
+    #[test]
+    fn control_keys_send_their_raw_byte_without_a_newline() {
+        let (mut session, sent) = recording_session();
+        session.input = "half typed".to_string();
+
+        session.send_control(ControlKey::CtrlC);
+        session.send_control(ControlKey::CtrlD);
+        session.send_control(ControlKey::CtrlZ);
+        session.send_control(ControlKey::Esc);
+
+        assert_eq!(*sent.borrow(), b"\x03\x04\x1a\x1b");
+        // The input bar's text was not part of any of those sends.
+        assert_eq!(session.input, "half typed");
+        assert!(session.log_text().is_empty());
+    }
+
+    #[test]
+    fn tab_sends_the_typed_prefix_then_a_tab_and_clears_the_input() {
+        let (mut session, sent) = recording_session();
+        session.input = "cd /us".to_string();
+
+        session.send_control(ControlKey::Tab);
+
+        assert_eq!(*sent.borrow(), b"cd /us\t");
+        assert_eq!(session.input, "");
+        assert_eq!(session.log_text(), "cd /us");
+        // A partial line is not history.
+        session.history_prev();
+        assert_eq!(session.input, "");
+    }
+
+    #[test]
+    fn control_keys_are_not_sent_once_disconnected() {
+        let (mut session, sent) = recording_session();
+        session.disconnect();
+        session.send_control(ControlKey::CtrlC);
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn timestamps_prefix_output_and_echoed_lines() {
+        let conn = MockConnection { incoming: b"remote line\n".to_vec() };
+        let mut session = Session::new(Box::new(conn), NewlineMode::Lf);
+        session.timestamps = true;
+        session.poll_connection();
+        session.send_text("ls");
+
+        let log = session.log_text();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with('[') && lines[0].ends_with("] remote line"));
+        assert!(lines[1].starts_with('[') && lines[1].ends_with("] ls"));
+    }
+
+    type SentSizes = std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>;
+
+    /// Records each resize the session sends.
+    struct ResizeConnection {
+        sizes: SentSizes,
+    }
+
+    impl Connection for ResizeConnection {
+        fn read_available(&mut self) -> std::io::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn write_all(&mut self, _data: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn resize(&mut self, cols: u32, rows: u32) -> std::io::Result<()> {
+            self.sizes.borrow_mut().push((cols, rows));
+            Ok(())
+        }
+        fn describe(&self) -> String {
+            "resize".to_string()
+        }
+        fn close(&mut self) {}
+    }
+
+    fn resize_session() -> (Session, SentSizes) {
+        let sizes = std::rc::Rc::default();
+        let conn = ResizeConnection { sizes: std::rc::Rc::clone(&sizes) };
+        (Session::new(Box::new(conn), NewlineMode::Lf), sizes)
+    }
+
+    #[test]
+    fn resize_is_sent_once_the_size_holds_still() {
+        let (mut session, sizes) = resize_session();
+        let t0 = Instant::now();
+
+        session.request_resize(100, 30, t0);
+        session.flush_resize(t0 + Duration::from_millis(50));
+        assert!(sizes.borrow().is_empty());
+
+        session.flush_resize(t0 + RESIZE_DEBOUNCE);
+        assert_eq!(*sizes.borrow(), [(100, 30)]);
+    }
+
+    #[test]
+    fn dragging_sends_only_the_final_size() {
+        let (mut session, sizes) = resize_session();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+
+        // Each frame of a drag reports a new size, restarting the wait.
+        for (i, cols) in [90, 95, 100, 105].into_iter().enumerate() {
+            let now = t0 + ms(30 * i as u64);
+            session.request_resize(cols, 30, now);
+            session.flush_resize(now);
+        }
+        assert!(sizes.borrow().is_empty());
+
+        session.flush_resize(t0 + ms(90) + RESIZE_DEBOUNCE);
+        assert_eq!(*sizes.borrow(), [(105, 30)]);
+    }
+
+    #[test]
+    fn unchanged_size_is_not_resent() {
+        let (mut session, sizes) = resize_session();
+        let t0 = Instant::now();
+        session.request_resize(80, 24, t0);
+        session.flush_resize(t0 + RESIZE_DEBOUNCE);
+
+        // Same size reported every frame afterwards: nothing more is sent.
+        let later = t0 + RESIZE_DEBOUNCE * 2;
+        session.request_resize(80, 24, later);
+        session.flush_resize(later + RESIZE_DEBOUNCE);
+        assert_eq!(*sizes.borrow(), [(80, 24)]);
+    }
+
+    #[test]
+    fn size_back_to_the_sent_one_mid_drag_is_not_resent() {
+        let (mut session, sizes) = resize_session();
+        let t0 = Instant::now();
+        session.request_resize(80, 24, t0);
+        session.flush_resize(t0 + RESIZE_DEBOUNCE);
+
+        let t1 = t0 + RESIZE_DEBOUNCE * 2;
+        session.request_resize(90, 24, t1);
+        session.request_resize(80, 24, t1 + Duration::from_millis(10));
+        session.flush_resize(t1 + RESIZE_DEBOUNCE * 2);
+        assert_eq!(*sizes.borrow(), [(80, 24)]);
     }
 }
