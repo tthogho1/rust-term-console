@@ -10,6 +10,7 @@ dirs = "7.0.0"
 eframe = "0.35.0"
 egui_commonmark = { version = "0.24.0", default-features = false, features = ["pulldown_cmark"] }
 quick-xml = "0.42.0"
+rhai = "1.26.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serialport = "4.10.1"
 ssh2 = "0.9.6"

@@ -229,6 +229,7 @@ pub fn draw_header(
     session: Option<&mut Session>,
     show_connect: &mut bool,
     show_notebook: &mut bool,
+    show_script: &mut bool,
     timestamps: &mut bool,
     log_path: &mut String,
 ) -> HeaderAction {
@@ -241,6 +242,8 @@ pub fn draw_header(
             }
             ui.menu_button("View", |ui| {
                 ui.checkbox(show_notebook, "Notebook");
+                ui.checkbox(show_script, "Script")
+                    .on_hover_text("A Rhai script that builds up commands to send");
                 ui.checkbox(timestamps, "Timestamps")
                     .on_hover_text("Prefix each new line with the local time, in the view and the log file");
             });
@@ -476,6 +479,90 @@ fn log_area_size_in_chars(ui: &egui::Ui) -> (u32, u32) {
     let cols = (width / char_width.max(1.0)).floor().max(1.0) as u32;
     let rows = (height / row_height.max(1.0)).floor().max(1.0) as u32;
     (cols, rows)
+}
+
+pub enum ScriptPanelAction {
+    None,
+    /// Run button pressed; the caller runs the script and sends whatever it
+    /// asked to send.
+    Run,
+    /// Write `source` to the path field as plain text.
+    Save,
+    /// Replace `source` with what the path field's file holds.
+    Load,
+}
+
+/// A Rhai script, drawn as a right side panel. Call only while it is shown.
+/// The script itself never touches the connection — running it only
+/// *collects* what to send (see `script.rs`); `can_run` is false while
+/// there is no live connection to send it over.
+pub fn draw_script(
+    ui: &mut egui::Ui,
+    source: &mut String,
+    file_path: &mut String,
+    output: &str,
+    error: Option<&str>,
+    can_run: bool,
+) -> ScriptPanelAction {
+    let mut action = ScriptPanelAction::None;
+
+    egui::Panel::right("script_panel").default_size(380.0).show(ui, |ui| {
+        ui.heading("Script");
+        ui.label(
+            "Rhai. send(text) queues a line to send; ctrl_c()/ctrl_d()/ctrl_z()/tab()/esc() queue a \
+             control key; print()/debug() show up below instead of being sent.",
+        );
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(file_path)
+                    .desired_width(ui.available_width() - 110.0)
+                    .hint_text("script.rhai"),
+            );
+            if ui.button("Save").clicked() {
+                action = ScriptPanelAction::Save;
+            }
+            if ui.button("Load").clicked() {
+                action = ScriptPanelAction::Load;
+            }
+        });
+        if let Some(err) = error {
+            ui.colored_label(Color32::from_rgb(220, 60, 60), err);
+        }
+        ui.separator();
+
+        ScrollArea::vertical()
+            .id_salt("script_source")
+            .max_height(ui.available_height() * 0.55)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add(
+                    TextEdit::multiline(source)
+                        .code_editor()
+                        .desired_rows(10)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("for i in range(0, 3) {\n    send(\"echo \" + i);\n}"),
+                );
+            });
+
+        ui.horizontal(|ui| {
+            if ui.add_enabled(can_run, egui::Button::new("Run")).clicked() {
+                action = ScriptPanelAction::Run;
+            }
+            if !can_run {
+                ui.label(RichText::new("Connect first to run a script").weak());
+            }
+        });
+        ui.separator();
+
+        ui.label(RichText::new("Output").strong());
+        ScrollArea::vertical().id_salt("script_output").auto_shrink([false, false]).show(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(output).monospace()).wrap().selectable(true));
+        });
+    });
+
+    action
 }
 
 /// Input bar and scrolling log. `session` is `None` until the first connect.

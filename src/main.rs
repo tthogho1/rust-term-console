@@ -6,6 +6,7 @@ mod config;
 mod connection;
 mod logfile;
 mod notebook;
+mod script;
 mod serial;
 mod ssh;
 mod timestamp;
@@ -17,7 +18,8 @@ use egui_commonmark::CommonMarkCache;
 use app::{ConnectForm, Session};
 use logfile::LogFile;
 use notebook::Cell;
-use ui::{ConnectAction, HeaderAction, NotebookAction};
+use script::ScriptAction;
+use ui::{ConnectAction, HeaderAction, NotebookAction, ScriptPanelAction};
 
 struct GuiApp {
     form: ConnectForm,
@@ -35,6 +37,14 @@ struct GuiApp {
     /// Rendered-Markdown cache for note cells; kept across frames so the
     /// panel doesn't reparse every cell every repaint.
     md_cache: CommonMarkCache,
+    /// Rhai script source and whether its panel is open.
+    script_source: String,
+    show_script: bool,
+    /// Path used by the script panel's Save/Load buttons.
+    script_path: String,
+    /// What the script's last run printed/debugged, or the error it hit.
+    script_output: String,
+    script_error: Option<String>,
 }
 
 impl Default for GuiApp {
@@ -48,6 +58,11 @@ impl Default for GuiApp {
             notebook_path: String::new(),
             notebook_error: None,
             md_cache: CommonMarkCache::default(),
+            script_source: String::new(),
+            show_script: false,
+            script_path: String::new(),
+            script_output: String::new(),
+            script_error: None,
         }
     }
 }
@@ -99,6 +114,27 @@ impl GuiApp {
             Err(e) => session.status = format!("Log start failed: {e:#}"),
         }
     }
+
+    /// Run the script panel's source and send whatever it asked to send, in
+    /// order. The script itself never touched the connection — it only
+    /// built this list (see `script.rs`) — so sending it now goes through
+    /// the normal `Session` path (local echo, history, logging) exactly as
+    /// if typed by hand.
+    fn run_script(&mut self) {
+        let (actions, output, error) = script::run(&self.script_source);
+        self.script_output = output;
+        self.script_error = error;
+
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        for action in actions {
+            match action {
+                ScriptAction::Send(text) => session.send_text(&text),
+                ScriptAction::Control(key) => session.send_control(key),
+            }
+        }
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -114,6 +150,7 @@ impl eframe::App for GuiApp {
             self.session.as_mut(),
             &mut self.show_connect,
             &mut self.show_notebook,
+            &mut self.show_script,
             &mut self.form.timestamps,
             &mut self.form.log_path,
         );
@@ -165,6 +202,33 @@ impl eframe::App for GuiApp {
                         self.notebook_error = None;
                     }
                     Err(e) => self.notebook_error = Some(format!("{e:#}")),
+                },
+            }
+        }
+
+        if self.show_script {
+            let can_run = self.session.as_ref().is_some_and(|s| s.connected);
+            let action = ui::draw_script(
+                ui,
+                &mut self.script_source,
+                &mut self.script_path,
+                &self.script_output,
+                self.script_error.as_deref(),
+                can_run,
+            );
+            match action {
+                ScriptPanelAction::None => {}
+                ScriptPanelAction::Run => self.run_script(),
+                ScriptPanelAction::Save => match script::save(&self.script_path, &self.script_source) {
+                    Ok(()) => self.script_error = None,
+                    Err(e) => self.script_error = Some(format!("{e:#}")),
+                },
+                ScriptPanelAction::Load => match script::load(&self.script_path) {
+                    Ok(source) => {
+                        self.script_source = source;
+                        self.script_error = None;
+                    }
+                    Err(e) => self.script_error = Some(format!("{e:#}")),
                 },
             }
         }

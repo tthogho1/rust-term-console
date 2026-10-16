@@ -46,6 +46,37 @@ to remove one. **Save**/**Load** at the top of the panel write/read the
 whole cell list as an XML file (path field to the left of the buttons);
 loading replaces the current cells.
 
+**View → Script** opens a right-hand panel holding a single [Rhai]
+script. It never touches the connection directly — running it only builds
+up a list of things to send, then hands that list back exactly as if
+you'd typed it or run it from a Notebook cell (same local echo, history,
+and logging). Inside a script:
+
+- `send(text)` queues a line (or several, one per `\n`) to send.
+- `ctrl_c()` / `ctrl_d()` / `ctrl_z()` / `tab()` / `esc()` queue a control
+  key, the same ones as the input bar's **Keys** menu.
+- `print(x)` / `debug(x)` show up in the panel's **Output** area instead of
+  being sent anywhere — useful for working out what a script *would* send
+  before wiring up the `send()` calls.
+
+For example:
+
+```rhai
+for i in range(0, 3) {
+    send("echo " + i);
+}
+```
+
+**Run** (disabled until connected) executes the whole script, then sends
+everything it queued, in order; any error it hit is shown under the path
+field, and partial progress up to that point is still sent. **Save**/**Load**
+work the same way as the Notebook's, as plain text (`.rhai` by convention).
+A runaway script (e.g. an infinite loop) is stopped automatically after a
+large but bounded number of operations rather than freezing the window
+forever — see "Known limitations" below.
+
+[Rhai]: https://rhai.rs/
+
 ## Using the app
 
 **Connect screen** (FR-2, FR-3, FR-O4):
@@ -114,11 +145,19 @@ loading replaces the current cells.
   runs everything it logs through it.
 - `notebook.rs` defines `Cell`/`CellKind` (Command vs Note) and their
   XML `save`/`load`, independent of the UI.
+- `script.rs` runs a [Rhai] script through a sandboxed `rhai::Engine`
+  (operation count capped so a runaway loop can't hang forever) with
+  `send`/`ctrl_c`/etc. registered as native functions that push onto a
+  shared `Rc<RefCell<Vec<ScriptAction>>>` rather than touching `Session`
+  directly — the script only *decides* what to send; `main.rs` sends it
+  afterwards through the normal path, so a script can't do anything typing
+  by hand couldn't.
 - `ui.rs` is pure `egui` rendering: `draw_header`, `draw_connect` (a left
-  side panel), `draw_notebook` (a right side panel, using `egui_commonmark`
-  to render Note cells) and `draw_terminal` take the current state and an
-  `egui::Ui`, and report back what the user did (`HeaderAction` /
-  `ConnectAction` / `NotebookAction`) rather than mutating app state
+  side panel), `draw_notebook` and `draw_script` (right side panels;
+  the former uses `egui_commonmark` to render Note cells) and
+  `draw_terminal` take the current state and an `egui::Ui`, and report
+  back what the user did (`HeaderAction` / `ConnectAction` /
+  `NotebookAction` / `ScriptPanelAction`) rather than mutating app state
   themselves.
 - `main.rs` implements `eframe::App`: it owns the form, the optional
   `Session` and the panel's open/closed flag, and acts on those actions
@@ -142,6 +181,11 @@ Matches the spec's phased roadmap — not yet implemented:
 
 - Session log formats other than plain text (FR-O3 is plain text only).
 - Notebook cells run one at a time; no "Run all" and no per-cell output.
+- Scripts are send-only: `send()`/`ctrl_c()` etc. queue bytes to go out, but
+  a script can't read back the connection's output or the log, so it can't
+  branch on a prompt or a command's result. Scripts also run synchronously
+  on the UI thread, so a slow (if bounded) script briefly freezes the
+  window, the same as connecting does.
 - Multiple concurrent connections / tabs (FR-O2).
 - Telnet transport (FR-O1 covers SSH only so far).
 - Full-screen interactive programs over the connection (vim, htop, less,
