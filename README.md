@@ -95,8 +95,12 @@ forever — see "Known limitations" below.
   dropdown. Passwords/passphrases are never stored — you'll always be
   prompted. Stored at `~/.config/rust-term-console/profiles.toml` (or the
   OS-appropriate config dir).
-- **Connect** opens the session; a failed attempt shows the error inline
-  and leaves the form filled in so you can fix it and retry (FR-5).
+- **Connect** starts opening the session on a background thread — the
+  window stays responsive (you can still edit the form, open other
+  panels, etc.) while a spinner and **Cancel** show in its place. A
+  failed attempt shows the error inline and leaves the form filled in so
+  you can fix it and retry (FR-5); **Cancel** just stops waiting on it —
+  see "Known limitations".
 
 **Terminal screen** (FR-4, FR-6, FR-7, FR-8):
 
@@ -162,10 +166,14 @@ forever — see "Known limitations" below.
 - `main.rs` implements `eframe::App`: it owns the form, the optional
   `Session` and the panel's open/closed flag, and acts on those actions
   (opening the connection, disconnecting).
-- Connecting is synchronous: a slow DNS lookup or SSH handshake briefly
-  freezes the window. Fine for LAN/typical use; a background thread with a
-  channel back to the UI is the natural next step for slow/unreliable
-  networks.
+- Connecting runs on a background thread: `ConnectForm::build_target`
+  validates the form and builds an owned `ConnectTarget` synchronously (so
+  a bad baud rate/port is reported immediately, with the existing session
+  left untouched), then `main::GuiApp::connect` hands that to
+  `thread::spawn` and polls an `mpsc` channel once per frame
+  (`poll_connect`) rather than blocking on it — `Connection: Send` exists
+  specifically so a `Box<dyn Connection>` can cross that channel. A slow
+  DNS lookup or SSH handshake no longer freezes the window.
 - Once connected, the terminal requests a repaint every ~30 ms so
   incoming data is picked up even without mouse/keyboard activity — needed
   because native GUI toolkits otherwise only redraw on input events.
@@ -191,5 +199,8 @@ Matches the spec's phased roadmap — not yet implemented:
 - Full-screen interactive programs over the connection (vim, htop, less,
   etc.) won't render correctly — the log is plain text, not a real
   cursor-addressed terminal grid.
-- Connecting runs on the UI thread (see above) rather than in the
-  background.
+- **Cancel** on a connect attempt only stops *waiting* on it in the UI;
+  the background thread isn't killed, and `ssh.rs` sets no connect
+  timeout, so an attempt to an unreachable host can keep running
+  (harmlessly — its result is just discarded) for as long as the OS
+  takes to give up on the TCP connect.

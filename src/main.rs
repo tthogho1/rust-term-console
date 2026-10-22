@@ -12,14 +12,30 @@ mod ssh;
 mod timestamp;
 mod ui;
 
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::thread;
+use std::time::Duration;
+
 use eframe::egui;
 use egui_commonmark::CommonMarkCache;
 
 use app::{ConnectForm, Session};
+use connection::Connection;
 use logfile::LogFile;
 use notebook::Cell;
 use script::ScriptAction;
 use ui::{ConnectAction, HeaderAction, NotebookAction, ScriptPanelAction};
+
+/// A connect attempt running on a background thread (see `GuiApp::connect`),
+/// polled once per frame rather than blocked on.
+struct PendingConnect {
+    receiver: Receiver<anyhow::Result<Box<dyn Connection>>>,
+    newline: connection::NewlineMode,
+    timestamps: bool,
+    /// Carried along so it's only opened once, by `connect()`, even though
+    /// it's attached to the `Session` after the background attempt finishes.
+    log_file: Option<LogFile>,
+}
 
 struct GuiApp {
     form: ConnectForm,
@@ -27,6 +43,9 @@ struct GuiApp {
     /// Whether the connect side panel is open. Starts open so the first
     /// thing the user sees is how to connect.
     show_connect: bool,
+    /// Set while a connect attempt is running on a background thread, so
+    /// the UI thread never blocks on a slow DNS lookup or SSH handshake.
+    connecting: Option<PendingConnect>,
     /// Notebook cells and whether their panel is open.
     cells: Vec<Cell>,
     show_notebook: bool,
@@ -53,6 +72,7 @@ impl Default for GuiApp {
             form: ConnectForm::default(),
             session: None,
             show_connect: true,
+            connecting: None,
             cells: vec![Cell::command()],
             show_notebook: false,
             notebook_path: String::new(),
@@ -68,12 +88,21 @@ impl Default for GuiApp {
 }
 
 impl GuiApp {
-    /// Open the connection described by the form. Any live session is closed
-    /// first so a serial port it holds is free to reopen. On failure the
-    /// error stays in the form and the panel stays open.
+    /// Start connecting as described by the form, on a background thread
+    /// (see `app::ConnectTarget::open`) so a slow DNS lookup or SSH
+    /// handshake doesn't block the UI thread. `self.connecting` is polled
+    /// once per frame in `ui()`; a bad path/port/baud is still reported
+    /// immediately, since `build_target` validates before anything is
+    /// spawned. Any live session is closed first so a serial port it holds
+    /// is free to reopen. Ignored if already connecting — cancel first.
     fn connect(&mut self) {
-        // Open the log file before touching the current session so a bad
-        // path fails cleanly instead of dropping a live connection.
+        if self.connecting.is_some() {
+            return;
+        }
+
+        // Open the log file before spawning the attempt so a bad path
+        // fails cleanly instead of starting a background connect for
+        // nothing.
         let log_file = if self.form.log_enabled {
             match LogFile::open(&self.form.log_path) {
                 Ok(file) => Some(file),
@@ -86,18 +115,59 @@ impl GuiApp {
             None
         };
 
+        let target = match self.form.build_target() {
+            Ok(target) => target,
+            Err(e) => {
+                self.form.error = Some(e.to_string());
+                return;
+            }
+        };
+
         if let Some(session) = self.session.as_mut() {
             session.disconnect();
         }
-        let newline = self.form.newline;
-        if let Some(conn) = self.form.connect() {
-            let mut session = Session::new(conn, newline);
-            session.timestamps = self.form.timestamps;
-            if let Some(file) = log_file {
-                session.set_log_file(file);
+        self.form.error = None;
+
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            let _ = tx.send(target.open());
+        });
+        self.connecting = Some(PendingConnect {
+            receiver: rx,
+            newline: self.form.newline,
+            timestamps: self.form.timestamps,
+            log_file,
+        });
+    }
+
+    /// Check on an in-flight connect attempt without blocking. Call once
+    /// per frame; does nothing if there isn't one.
+    fn poll_connect(&mut self) {
+        let Some(pending) = self.connecting.as_mut() else {
+            return;
+        };
+        match pending.receiver.try_recv() {
+            Ok(Ok(conn)) => {
+                let pending = self.connecting.take().expect("just matched Some above");
+                let mut session = Session::new(conn, pending.newline);
+                session.timestamps = pending.timestamps;
+                if let Some(file) = pending.log_file {
+                    session.set_log_file(file);
+                }
+                self.session = Some(session);
+                self.show_connect = false;
             }
-            self.session = Some(session);
-            self.show_connect = false;
+            Ok(Err(e)) => {
+                self.form.error = Some(format!("{e:#}"));
+                self.connecting = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                // The sending thread panicked without sending; don't leave
+                // the panel stuck showing a spinner forever.
+                self.form.error = Some("Connection attempt ended unexpectedly".to_string());
+                self.connecting = None;
+            }
         }
     }
 }
@@ -139,6 +209,13 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_connect();
+        if self.connecting.is_some() {
+            // Keep polling even without mouse/keyboard input, same reason
+            // draw_terminal does this while connected (see below).
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+
         if let Some(session) = self.session.as_mut() {
             session.timestamps = self.form.timestamps;
             session.poll_connection();
@@ -169,10 +246,12 @@ impl eframe::App for GuiApp {
             }
         }
 
-        if self.show_connect
-            && let ConnectAction::Connect = ui::draw_connect(ui, &mut self.form)
-        {
-            self.connect();
+        if self.show_connect {
+            match ui::draw_connect(ui, &mut self.form, self.connecting.is_some()) {
+                ConnectAction::None => {}
+                ConnectAction::Connect => self.connect(),
+                ConnectAction::Cancel => self.connecting = None,
+            }
         }
 
         if self.show_notebook {

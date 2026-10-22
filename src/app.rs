@@ -172,27 +172,21 @@ impl ConnectForm {
         }
     }
 
-    /// FR-3: attempt to open the connection described by the form. Runs
-    /// synchronously — a slow DNS lookup or handshake briefly blocks the
-    /// UI thread (see README "Known limitations").
-    pub fn connect(&mut self) -> Option<Box<dyn Connection>> {
-        let result = match self.mode {
-            ConnMode::Serial => self.connect_serial(),
-            ConnMode::Ssh => self.connect_ssh(),
-        };
-        match result {
-            Ok(conn) => {
-                self.error = None;
-                Some(conn)
-            }
-            Err(e) => {
-                self.error = Some(e.to_string());
-                None
-            }
+    /// FR-3: validate the form and build an owned, transport-specific
+    /// target. This is the only part of connecting that touches `self`, and
+    /// it does no I/O — bad input (an unparsable port/baud, say) is
+    /// reported immediately rather than after a background attempt starts.
+    /// The caller runs the actual connect (`ConnectTarget::open`) wherever
+    /// it likes, typically on a background thread (see README "Known
+    /// limitations" and `main::GuiApp::connect`).
+    pub fn build_target(&self) -> anyhow::Result<ConnectTarget> {
+        match self.mode {
+            ConnMode::Serial => self.build_serial_target(),
+            ConnMode::Ssh => self.build_ssh_target(),
         }
     }
 
-    fn connect_serial(&self) -> anyhow::Result<Box<dyn Connection>> {
+    fn build_serial_target(&self) -> anyhow::Result<ConnectTarget> {
         use serialport::{DataBits, FlowControl, Parity, StopBits};
 
         let baud_rate: u32 = self.baud.parse().map_err(|_| anyhow::anyhow!("invalid baud rate '{}'", self.baud))?;
@@ -214,18 +208,17 @@ impl ConnectForm {
             _ => FlowControl::None,
         };
 
-        let config = SerialConfig {
+        Ok(ConnectTarget::Serial(SerialConfig {
             port_name: self.serial_port.clone(),
             baud_rate,
             data_bits,
             parity,
             stop_bits,
             flow_control,
-        };
-        Ok(Box::new(crate::serial::SerialConnection::open(config)?))
+        }))
     }
 
-    fn connect_ssh(&self) -> anyhow::Result<Box<dyn Connection>> {
+    fn build_ssh_target(&self) -> anyhow::Result<ConnectTarget> {
         let port: u16 = self.ssh_port.parse().map_err(|_| anyhow::anyhow!("invalid port '{}'", self.ssh_port))?;
         let auth = match self.auth_mode {
             AuthMode::Password => SshAuth::Password(self.password.clone()),
@@ -235,7 +228,7 @@ impl ConnectForm {
             },
             AuthMode::Agent => SshAuth::Agent,
         };
-        let config = SshConfig {
+        Ok(ConnectTarget::Ssh(SshConfig {
             host: self.host.clone(),
             port,
             username: self.username.clone(),
@@ -243,8 +236,27 @@ impl ConnectForm {
             term: "xterm-256color".to_string(),
             cols: 120,
             rows: 32,
-        };
-        Ok(Box::new(SshConnection::connect(config)?))
+        }))
+    }
+}
+
+/// The blocking part of connecting, split out from `ConnectForm` so it owns
+/// everything it needs and can run on a background thread without
+/// borrowing the form (which keeps being drawn/edited while it runs).
+pub enum ConnectTarget {
+    Serial(SerialConfig),
+    Ssh(SshConfig),
+}
+
+impl ConnectTarget {
+    /// Does the actual blocking I/O: opening the serial port, or the TCP
+    /// connect + SSH handshake + auth + PTY/shell setup. Safe to call from
+    /// any thread — `Connection: Send` is exactly so this can run here.
+    pub fn open(self) -> anyhow::Result<Box<dyn Connection>> {
+        match self {
+            ConnectTarget::Serial(config) => Ok(Box::new(crate::serial::SerialConnection::open(config)?)),
+            ConnectTarget::Ssh(config) => Ok(Box::new(SshConnection::connect(config)?)),
+        }
     }
 }
 
@@ -547,6 +559,37 @@ impl Session {
 mod tests {
     use super::*;
 
+    #[test]
+    fn build_target_validates_before_any_io() {
+        // `ConnectTarget` deliberately has no `Debug` impl (it would have to
+        // go through `SshAuth::Password`), so assert on the error via
+        // pattern matching rather than `unwrap_err()`.
+        let mut form = ConnectForm { mode: ConnMode::Serial, baud: "not a number".to_string(), ..ConnectForm::default() };
+        let Err(err) = form.build_target() else { panic!("expected an invalid-baud error") };
+        assert!(err.to_string().contains("invalid baud rate"));
+
+        form.mode = ConnMode::Ssh;
+        form.ssh_port = "not a port".to_string();
+        let Err(err) = form.build_target() else { panic!("expected an invalid-port error") };
+        assert!(err.to_string().contains("invalid port"));
+    }
+
+    /// The whole point of splitting `ConnectTarget` out of `ConnectForm` is
+    /// so `main::GuiApp::connect` can run `.open()` on a background thread
+    /// (see README "Known limitations"). If `Connection`/`ConnectTarget`
+    /// ever stopped being `Send`, that call site would fail to compile —
+    /// this test exercises the same `thread::spawn` so it fails here too,
+    /// with a clearer message than a distant compile error would give.
+    #[test]
+    fn connect_target_can_run_on_a_background_thread() {
+        let form =
+            ConnectForm { mode: ConnMode::Serial, serial_port: "/dev/does-not-exist".to_string(), ..ConnectForm::default() };
+        let target = form.build_target().unwrap();
+
+        let result = std::thread::spawn(move || target.open()).join().unwrap();
+        assert!(result.is_err()); // the port doesn't exist, but it ran off-thread fine
+    }
+
     struct MockConnection {
         incoming: Vec<u8>,
     }
@@ -665,8 +708,10 @@ mod tests {
     }
 
     /// Records everything written so tests can check the exact bytes sent.
+    /// `Arc<Mutex<_>>` rather than `Rc<RefCell<_>>` because `Connection: Send`
+    /// (background-thread connecting needs it; see `ConnectTarget::open`).
     struct RecordingConnection {
-        sent: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        sent: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     }
 
     impl Connection for RecordingConnection {
@@ -674,7 +719,7 @@ mod tests {
             Ok(Vec::new())
         }
         fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-            self.sent.borrow_mut().extend_from_slice(data);
+            self.sent.lock().unwrap().extend_from_slice(data);
             Ok(())
         }
         fn describe(&self) -> String {
@@ -683,9 +728,9 @@ mod tests {
         fn close(&mut self) {}
     }
 
-    fn recording_session() -> (Session, std::rc::Rc<std::cell::RefCell<Vec<u8>>>) {
-        let sent = std::rc::Rc::default();
-        let conn = RecordingConnection { sent: std::rc::Rc::clone(&sent) };
+    fn recording_session() -> (Session, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        let sent = std::sync::Arc::default();
+        let conn = RecordingConnection { sent: std::sync::Arc::clone(&sent) };
         (Session::new(Box::new(conn), NewlineMode::CrLf), sent)
     }
 
@@ -699,7 +744,7 @@ mod tests {
         session.send_control(ControlKey::CtrlZ);
         session.send_control(ControlKey::Esc);
 
-        assert_eq!(*sent.borrow(), b"\x03\x04\x1a\x1b");
+        assert_eq!(*sent.lock().unwrap(), b"\x03\x04\x1a\x1b");
         // The input bar's text was not part of any of those sends.
         assert_eq!(session.input, "half typed");
         assert!(session.log_text().is_empty());
@@ -712,7 +757,7 @@ mod tests {
 
         session.send_control(ControlKey::Tab);
 
-        assert_eq!(*sent.borrow(), b"cd /us\t");
+        assert_eq!(*sent.lock().unwrap(), b"cd /us\t");
         assert_eq!(session.input, "");
         assert_eq!(session.log_text(), "cd /us");
         // A partial line is not history.
@@ -725,7 +770,7 @@ mod tests {
         let (mut session, sent) = recording_session();
         session.disconnect();
         session.send_control(ControlKey::CtrlC);
-        assert!(sent.borrow().is_empty());
+        assert!(sent.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -743,7 +788,7 @@ mod tests {
         assert!(lines[1].starts_with('[') && lines[1].ends_with("] ls"));
     }
 
-    type SentSizes = std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>;
+    type SentSizes = std::sync::Arc<std::sync::Mutex<Vec<(u32, u32)>>>;
 
     /// Records each resize the session sends.
     struct ResizeConnection {
@@ -758,7 +803,7 @@ mod tests {
             Ok(())
         }
         fn resize(&mut self, cols: u32, rows: u32) -> std::io::Result<()> {
-            self.sizes.borrow_mut().push((cols, rows));
+            self.sizes.lock().unwrap().push((cols, rows));
             Ok(())
         }
         fn describe(&self) -> String {
@@ -768,8 +813,8 @@ mod tests {
     }
 
     fn resize_session() -> (Session, SentSizes) {
-        let sizes = std::rc::Rc::default();
-        let conn = ResizeConnection { sizes: std::rc::Rc::clone(&sizes) };
+        let sizes = std::sync::Arc::default();
+        let conn = ResizeConnection { sizes: std::sync::Arc::clone(&sizes) };
         (Session::new(Box::new(conn), NewlineMode::Lf), sizes)
     }
 
@@ -780,10 +825,10 @@ mod tests {
 
         session.request_resize(100, 30, t0);
         session.flush_resize(t0 + Duration::from_millis(50));
-        assert!(sizes.borrow().is_empty());
+        assert!(sizes.lock().unwrap().is_empty());
 
         session.flush_resize(t0 + RESIZE_DEBOUNCE);
-        assert_eq!(*sizes.borrow(), [(100, 30)]);
+        assert_eq!(*sizes.lock().unwrap(), [(100, 30)]);
     }
 
     #[test]
@@ -798,10 +843,10 @@ mod tests {
             session.request_resize(cols, 30, now);
             session.flush_resize(now);
         }
-        assert!(sizes.borrow().is_empty());
+        assert!(sizes.lock().unwrap().is_empty());
 
         session.flush_resize(t0 + ms(90) + RESIZE_DEBOUNCE);
-        assert_eq!(*sizes.borrow(), [(105, 30)]);
+        assert_eq!(*sizes.lock().unwrap(), [(105, 30)]);
     }
 
     #[test]
@@ -815,7 +860,7 @@ mod tests {
         let later = t0 + RESIZE_DEBOUNCE * 2;
         session.request_resize(80, 24, later);
         session.flush_resize(later + RESIZE_DEBOUNCE);
-        assert_eq!(*sizes.borrow(), [(80, 24)]);
+        assert_eq!(*sizes.lock().unwrap(), [(80, 24)]);
     }
 
     #[test]
@@ -829,6 +874,6 @@ mod tests {
         session.request_resize(90, 24, t1);
         session.request_resize(80, 24, t1 + Duration::from_millis(10));
         session.flush_resize(t1 + RESIZE_DEBOUNCE * 2);
-        assert_eq!(*sizes.borrow(), [(80, 24)]);
+        assert_eq!(*sizes.lock().unwrap(), [(80, 24)]);
     }
 }

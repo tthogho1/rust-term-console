@@ -6,7 +6,11 @@
 use std::io;
 
 /// A live, byte-oriented session (serial port or SSH shell channel).
-pub trait Connection {
+///
+/// `Send` so a `Box<dyn Connection>` can be built on a background thread
+/// (see `app::ConnectTarget::open`) and handed back to the UI thread once
+/// the connect/handshake is done, instead of blocking it.
+pub trait Connection: Send {
     /// Return whatever bytes are available right now without blocking for
     /// long. An empty `Vec` means "nothing to read yet", not EOF.
     fn read_available(&mut self) -> io::Result<Vec<u8>>;

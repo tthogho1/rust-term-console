@@ -15,8 +15,12 @@ use crate::notebook::{Cell, CellKind};
 
 pub enum ConnectAction {
     None,
-    /// The Connect button was pressed; the caller opens the connection.
+    /// The Connect button was pressed; the caller starts connecting.
     Connect,
+    /// Cancel was pressed while connecting; the caller drops the attempt
+    /// (it keeps running to completion in the background, but its result
+    /// is ignored).
+    Cancel,
 }
 
 pub enum HeaderAction {
@@ -28,19 +32,21 @@ pub enum HeaderAction {
 }
 
 /// Connect form, drawn as a left side panel. Call only while it is shown.
-pub fn draw_connect(ui: &mut egui::Ui, form: &mut ConnectForm) -> ConnectAction {
+/// `connecting` is true while a background attempt (started by a previous
+/// `Connect`) hasn't resolved yet.
+pub fn draw_connect(ui: &mut egui::Ui, form: &mut ConnectForm, connecting: bool) -> ConnectAction {
     let mut action = ConnectAction::None;
 
     egui::Panel::left("connect_panel").default_size(320.0).show(ui, |ui| {
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            draw_connect_form(ui, form, &mut action);
+            draw_connect_form(ui, form, connecting, &mut action);
         });
     });
 
     action
 }
 
-fn draw_connect_form(ui: &mut egui::Ui, form: &mut ConnectForm, action: &mut ConnectAction) {
+fn draw_connect_form(ui: &mut egui::Ui, form: &mut ConnectForm, connecting: bool, action: &mut ConnectAction) {
     ui.heading("Connection");
     ui.label("Connect over SSH or a serial port.");
     ui.separator();
@@ -87,7 +93,15 @@ fn draw_connect_form(ui: &mut egui::Ui, form: &mut ConnectForm, action: &mut Con
         ui.colored_label(Color32::from_rgb(220, 60, 60), err);
     }
 
-    if ui.button(RichText::new("Connect").strong()).clicked() {
+    if connecting {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Connecting…");
+            if ui.button("Cancel").clicked() {
+                *action = ConnectAction::Cancel;
+            }
+        });
+    } else if ui.button(RichText::new("Connect").strong()).clicked() {
         *action = ConnectAction::Connect;
     }
 }
