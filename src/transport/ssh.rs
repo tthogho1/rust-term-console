@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ssh2::Session;
 
-use crate::connection::{Connection, connect_tcp_with_timeout};
+use crate::transport::{Connection, connect_tcp_with_timeout};
 
 /// How long to wait for the initial TCP connect before giving up. The
 /// handshake/auth steps that follow aren't bounded by this — see README

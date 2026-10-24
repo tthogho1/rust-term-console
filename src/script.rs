@@ -16,7 +16,7 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use rhai::Engine;
 
-use crate::connection::ControlKey;
+use crate::transport::ControlKey;
 
 /// One thing a script asked to send, in the order it asked for them.
 #[derive(Debug, Clone)]

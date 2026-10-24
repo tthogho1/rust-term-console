@@ -8,8 +8,8 @@ windowed GUI (`egui`/`eframe`) instead, matching FR-O5 / Phase 4 of the
 roadmap ahead of schedule, so the connect flow looks like Tera Term's own
 dialog rather than command-line flags. A transport-agnostic `Connection`
 trait keeps the serial, SSH and Telnet backends sharing one poll loop, in
-a modular layout (`app.rs` / `ui.rs` / `serial.rs` / `ssh.rs` /
-`telnet.rs` / `config.rs` / `main.rs`).
+a modular layout (`app.rs` / `ui.rs` / `transport/{serial,ssh,telnet}.rs` /
+`config.rs` / `main.rs`).
 
 ## Build
 
@@ -133,29 +133,31 @@ forever — see "Known limitations" below.
 
 ## Architecture notes
 
-- `connection.rs` defines the `Connection` trait (`read_available`,
+- `transport/mod.rs` defines the `Connection` trait (`read_available`,
   `write_all`, `describe`, `close`) that all three transports implement,
   plus `NewlineMode`, `ControlKey` (the raw bytes behind Ctrl+C/D/Z, Tab,
-  Esc) and `connect_tcp_with_timeout` (shared by `ssh.rs`/`telnet.rs`: it
-  resolves the host and tries `TcpStream::connect_timeout` on each
-  address, since plain `TcpStream::connect` has no timeout at all — against
-  a host that drops packets rather than refusing the connection, that
-  would otherwise mean waiting out the OS's own retransmission timeout
-  instead, commonly a minute or more).
+  Esc) and `connect_tcp_with_timeout` (shared by `transport::ssh` and
+  `transport::telnet`: it resolves the host and tries
+  `TcpStream::connect_timeout` on each address, since plain
+  `TcpStream::connect` has no timeout at all — against a host that drops
+  packets rather than refusing the connection, that would otherwise mean
+  waiting out the OS's own retransmission timeout instead, commonly a
+  minute or more).
 - Remote terminal size follows the window: each frame the log area's size
   is measured in monospace characters, and once it has held still for
   200 ms `Session` sends it via `Connection::resize` (SSH
   `request_pty_size`; a no-op on serial and Telnet). So `ls`, `top`, long
   prompts etc. wrap at the window's width rather than a fixed 120 columns
   over SSH.
-- `serial.rs` wraps `serialport` with a short read timeout so polling never
-  blocks the UI thread.
-- `ssh.rs` wraps `ssh2`: TCP connect (10s timeout) → handshake →
+- `transport/serial.rs` wraps `serialport` with a short read timeout so
+  polling never blocks the UI thread.
+- `transport/ssh.rs` wraps `ssh2`: TCP connect (10s timeout) → handshake →
   password/key/agent auth → PTY + shell channel, then switches the session
   to non-blocking mode for the same poll-driven reads. The handshake/auth
   steps aren't bounded by that timeout — see "Known limitations".
-- `telnet.rs` is a plain TCP connection (10s connect timeout, same as SSH)
-  plus a small stateful parser for Telnet's `IAC` command sequences
+- `transport/telnet.rs` is a plain TCP connection (10s connect timeout,
+  same as SSH) plus a small stateful parser for Telnet's `IAC` command
+  sequences
   (mirrors `AnsiFilter`'s approach to ANSI escapes: a sequence split across
   two reads is still recognized). It refuses every option the server
   offers (`WILL`) or requests (`DO`) — see "Known limitations" for what
@@ -217,7 +219,7 @@ Matches the spec's phased roadmap — not yet implemented:
   so a slow (if bounded) script still briefly freezes the window.
 - Multiple concurrent connections / tabs (FR-O2).
 - Telnet always negotiates plain NVT mode, refusing every option (FR-O1 is
-  done, but see `telnet.rs`): no character-at-a-time input (the input bar
+  done, but see `transport/telnet.rs`): no character-at-a-time input (the input bar
   sends whole lines either way, so this matches how SSH/serial already
   work here), no local echo suppression (a password prompt over Telnet
   will show what you type — there's no way around this without

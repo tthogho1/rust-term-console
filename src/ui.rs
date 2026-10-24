@@ -10,7 +10,7 @@ use eframe::egui::{self, Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::app::{AuthMode, ConnMode, ConnectForm, Session};
-use crate::connection::{ControlKey, NewlineMode};
+use crate::transport::{ControlKey, NewlineMode};
 use crate::notebook::{Cell, CellKind};
 
 pub enum ConnectAction {

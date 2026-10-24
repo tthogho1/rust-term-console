@@ -1,8 +1,11 @@
-//! Transport-agnostic connection abstraction.
-//!
-//! `serial.rs`, `ssh.rs` and `telnet.rs` each provide a `Connection`
-//! implementation so `app.rs`/`main.rs` can drive any transport through the
-//! same loop.
+//! Transport-agnostic connection abstraction, plus the transports
+//! themselves as submodules: `serial`, `ssh` and `telnet` each provide a
+//! `Connection` implementation so `app.rs`/`main.rs` can drive any
+//! transport through the same loop.
+
+pub mod serial;
+pub mod ssh;
+pub mod telnet;
 
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};

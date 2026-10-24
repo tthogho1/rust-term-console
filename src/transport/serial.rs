@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
 
-use crate::connection::Connection;
+use crate::transport::Connection;
 
 /// User-facing serial configuration (FR-2).
 #[derive(Debug, Clone)]

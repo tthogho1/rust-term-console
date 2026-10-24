@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 use crate::ansi::AnsiFilter;
 use crate::config::{self, Profile};
-use crate::connection::{Connection, ControlKey, NewlineMode};
 use crate::logfile::LogFile;
-use crate::serial::{self, SerialConfig};
-use crate::ssh::{SshAuth, SshConfig, SshConnection};
-use crate::telnet::{TelnetConfig, TelnetConnection};
 use crate::timestamp::{self, LineStamper};
+use crate::transport::serial::{self, SerialConfig};
+use crate::transport::ssh::{SshAuth, SshConfig, SshConnection};
+use crate::transport::telnet::{TelnetConfig, TelnetConnection};
+use crate::transport::{Connection, ControlKey, NewlineMode};
 
 /// Cap on retained output so long-running sessions stay bounded (NFR-4).
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
@@ -283,7 +283,7 @@ impl ConnectTarget {
     /// Send` is exactly so this can run here.
     pub fn open(self) -> anyhow::Result<Box<dyn Connection>> {
         match self {
-            ConnectTarget::Serial(config) => Ok(Box::new(crate::serial::SerialConnection::open(config)?)),
+            ConnectTarget::Serial(config) => Ok(Box::new(crate::transport::serial::SerialConnection::open(config)?)),
             ConnectTarget::Ssh(config) => Ok(Box::new(SshConnection::connect(config)?)),
             ConnectTarget::Telnet(config) => Ok(Box::new(TelnetConnection::connect(config)?)),
         }

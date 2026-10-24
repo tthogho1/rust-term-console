@@ -3,14 +3,11 @@
 mod ansi;
 mod app;
 mod config;
-mod connection;
 mod logfile;
 mod notebook;
 mod script;
-mod serial;
-mod ssh;
-mod telnet;
 mod timestamp;
+mod transport;
 mod ui;
 
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -21,17 +18,17 @@ use eframe::egui;
 use egui_commonmark::CommonMarkCache;
 
 use app::{ConnectForm, Session};
-use connection::Connection;
 use logfile::LogFile;
 use notebook::Cell;
 use script::ScriptAction;
+use transport::Connection;
 use ui::{ConnectAction, HeaderAction, NotebookAction, ScriptPanelAction};
 
 /// A connect attempt running on a background thread (see `GuiApp::connect`),
 /// polled once per frame rather than blocked on.
 struct PendingConnect {
     receiver: Receiver<anyhow::Result<Box<dyn Connection>>>,
-    newline: connection::NewlineMode,
+    newline: transport::NewlineMode,
     timestamps: bool,
     /// Carried along so it's only opened once, by `connect()`, even though
     /// it's attached to the `Session` after the background attempt finishes.

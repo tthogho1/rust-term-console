@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::connection::{Connection, connect_tcp_with_timeout};
+use crate::transport::{Connection, connect_tcp_with_timeout};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
