@@ -119,6 +119,12 @@ forever — see "Known limitations" below.
   **↑/↓** recall previously sent lines (from the input bar or a notebook
   cell), most recent first; ↓ past the most recent restores whatever you
   had typed before you started recalling.
+- **🔒** (next to Send) arms hidden input for the next line only, for a
+  password or other secret typed at a remote prompt: the input bar masks
+  what you type, and once sent, that line is neither echoed (a `[hidden
+  input]` placeholder takes its place in the log and log file) nor
+  recorded in history — so pressing ↑ afterward can't bring it back. It
+  turns itself back off after that one send.
 - **Control keys**: with the input bar focused, **Ctrl+C** (interrupt),
   **Ctrl+D** (end of input), **Ctrl+Z** (suspend) and **Esc** are sent to
   the remote as their raw byte, no newline — so you can stop a running
@@ -166,7 +172,12 @@ forever — see "Known limitations" below.
 - `app.rs` holds `ConnectForm` (the dialog's fields and profile
   load/save/connect logic) and `Session` (log buffer capped at 2 MB, input
   line, sent-line history capped at 500 entries, connection status) — both
-  transport-agnostic.
+  transport-agnostic. `Session::send_hidden` is the one-shot counterpart
+  to `send_text` for the input bar's **🔒** toggle: it sends the real
+  bytes but logs a `[hidden input]` placeholder instead of the line
+  itself and skips `record_history`, so a password typed there never
+  ends up in plain text anywhere this app controls — the log, the log
+  file, or history.
 - `timestamp.rs` holds `LineStamper`, which inserts the time stamp before
   each line's first byte and tracks line position across reads; `Session`
   runs everything it logs through it.
@@ -219,14 +230,15 @@ Matches the spec's phased roadmap — not yet implemented:
   so a slow (if bounded) script still briefly freezes the window.
 - Multiple concurrent connections / tabs (FR-O2).
 - Telnet always negotiates plain NVT mode, refusing every option (FR-O1 is
-  done, but see `transport/telnet.rs`): no character-at-a-time input (the input bar
-  sends whole lines either way, so this matches how SSH/serial already
-  work here), no local echo suppression (a password prompt over Telnet
-  will show what you type — there's no way around this without
-  negotiating `ECHO`, which would need per-keystroke sending to implement
-  properly), and no window-size negotiation (`NAWS`), so remote-side
-  wrapping to the window's width — which SSH gets via `request_pty_size` —
-  doesn't happen over Telnet.
+  done, but see `transport/telnet.rs`): no character-at-a-time input (the
+  input bar sends whole lines either way, so this matches how SSH/serial
+  already work here), and no window-size negotiation (`NAWS`), so
+  remote-side wrapping to the window's width — which SSH gets via
+  `request_pty_size` — doesn't happen over Telnet. There's also no way for
+  the remote to tell the app a password prompt is coming (that needs
+  `WILL ECHO`, which we refuse): the **🔒** toggle hides the next line you
+  type, but nothing arms it for you, so it's on you to remember to click
+  it before a password rather than after.
 - Full-screen interactive programs over the connection (vim, htop, less,
   etc.) won't render correctly — the log is plain text, not a real
   cursor-addressed terminal grid.

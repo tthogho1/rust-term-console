@@ -608,16 +608,28 @@ pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
                     control = take_control_shortcut(ui, input_id);
                 }
 
+                let hint = if session.hide_input {
+                    "Hidden: sent but not shown or recorded (\u{2191}/\u{2193} for history)"
+                } else {
+                    "Type and press Enter to send (\u{2191}/\u{2193} for history)"
+                };
                 let response = ui.add_enabled(
                     session.connected,
                     TextEdit::singleline(&mut session.input)
                         .id(input_id)
+                        .password(session.hide_input)
                         // Keep focus on Tab so it can be sent for completion.
                         .lock_focus(true)
                         .desired_width(ui.available_width() - 150.0)
-                        .hint_text("Type and press Enter to send (\u{2191}/\u{2193} for history)"),
+                        .hint_text(hint),
                 );
                 let send_clicked = ui.add_enabled(session.connected, egui::Button::new("Send")).clicked();
+                ui.add_enabled_ui(session.connected, |ui| {
+                    ui.toggle_value(&mut session.hide_input, "\u{1f512}").on_hover_text(
+                        "Hide the next line sent (e.g. a password): masked while typing, \
+                         and not shown or recorded once sent",
+                    );
+                });
                 if ui
                     .add_enabled(session.connected, egui::Button::new("^C"))
                     .on_hover_text(ControlKey::CtrlC.label())
@@ -651,7 +663,11 @@ pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
                     session.send_control(key);
                     response.request_focus();
                 } else if session.connected && (enter_pressed || send_clicked) {
-                    session.send_current_input();
+                    if session.hide_input {
+                        session.send_current_input_hidden();
+                    } else {
+                        session.send_current_input();
+                    }
                     response.request_focus();
                 } else if session.connected && ui.memory(|m| m.focused().is_none()) {
                     response.request_focus();
@@ -683,6 +699,9 @@ pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
                         .hint_text("Not connected"),
                 );
                 ui.add_enabled(false, egui::Button::new("Send"));
+                ui.add_enabled_ui(false, |ui| {
+                    ui.toggle_value(&mut false, "\u{1f512}");
+                });
                 ui.add_enabled(false, egui::Button::new("^C"));
                 ui.add_enabled(false, egui::Button::new("Keys"));
             }

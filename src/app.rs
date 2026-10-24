@@ -302,6 +302,11 @@ pub struct Session {
     /// Stamp each new line (output and local echo) with the local time.
     pub timestamps: bool,
     pub input: String,
+    /// When set, the input bar masks what's typed and the next line it
+    /// sends (e.g. a password at a remote prompt) is neither echoed in
+    /// plain form to the log/log file nor recorded in history. Reset to
+    /// `false` after that one send — see `send_current_input_hidden`.
+    pub hide_input: bool,
     /// Lines previously sent, oldest first (from the input bar and from
     /// notebook cells), for Up/Down recall in the input bar.
     history: Vec<String>,
@@ -332,6 +337,7 @@ impl Session {
             stamper: LineStamper::default(),
             timestamps: false,
             input: String::new(),
+            hide_input: false,
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
@@ -465,6 +471,20 @@ impl Session {
         self.send_text(&text);
     }
 
+    /// Like `send_current_input`, but as hidden input (see `send_hidden`):
+    /// for a password or other secret typed at a remote prompt, where even
+    /// local echo into our own log would expose it. Turns `hide_input`
+    /// back off afterward — it's a one-shot armed for a single send, not a
+    /// standing mode, so a later ordinary line isn't hidden by mistake.
+    pub fn send_current_input_hidden(&mut self) {
+        self.hide_input = false;
+        if !self.connected || self.input.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.input);
+        self.send_hidden(&text);
+    }
+
     /// Send `text` one line at a time, each followed by the configured
     /// newline. Used by the input bar and by notebook cells, so both show up
     /// in the log the same way.
@@ -496,6 +516,36 @@ impl Session {
         }
     }
 
+    /// Send `text` as a single line, exactly like one line of `send_text`,
+    /// except it is never echoed in plain form (the log/log file get a
+    /// `[hidden input]` placeholder instead, so it's still clear that
+    /// *something* was sent) and never recorded in history — both of which
+    /// would otherwise leave a typed password sitting in plain text on
+    /// screen, on disk, or one Up-arrow-press away.
+    pub fn send_hidden(&mut self, text: &str) {
+        if !self.connected || text.is_empty() {
+            return;
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+
+        let mut payload = text.as_bytes().to_vec();
+        payload.extend_from_slice(self.newline_mode.as_bytes());
+
+        self.append_log(b"[hidden input]");
+        self.append_log(self.newline_mode.as_bytes());
+
+        if let Some(conn) = self.connection.as_mut()
+            && let Err(e) = conn.write_all(&payload)
+        {
+            self.status = format!("Send failed: {e}");
+            self.connected = false;
+            if let Some(mut conn) = self.connection.take() {
+                conn.close();
+            }
+        }
+    }
+
     /// Send `key` as its raw byte, with no newline. Tab first sends whatever
     /// is typed in the input bar (and clears it) so the remote shell can
     /// complete it; the rest of the line is then typed and sent as usual.
@@ -510,7 +560,11 @@ impl Session {
             let partial = std::mem::take(&mut self.input);
             self.history_index = None;
             self.history_draft.clear();
-            self.append_log(partial.as_bytes());
+            if self.hide_input {
+                self.append_log(b"[hidden input]");
+            } else {
+                self.append_log(partial.as_bytes());
+            }
             payload.extend_from_slice(partial.as_bytes());
         }
         payload.push(key.byte());
@@ -798,6 +852,46 @@ mod tests {
         // A partial line is not history.
         session.history_prev();
         assert_eq!(session.input, "");
+    }
+
+    #[test]
+    fn send_hidden_sends_real_bytes_but_logs_a_placeholder_and_skips_history() {
+        let (mut session, sent) = recording_session();
+
+        session.send_hidden("super-secret");
+
+        assert_eq!(*sent.lock().unwrap(), b"super-secret\r\n");
+        assert_eq!(session.log_text(), "[hidden input]\r\n");
+        // The secret never entered history, so there's nothing to recall.
+        session.history_prev();
+        assert_eq!(session.input, "");
+    }
+
+    #[test]
+    fn send_current_input_hidden_clears_input_and_turns_off_hide_input() {
+        let (mut session, sent) = recording_session();
+        session.input = "super-secret".to_string();
+        session.hide_input = true;
+
+        session.send_current_input_hidden();
+
+        assert_eq!(*sent.lock().unwrap(), b"super-secret\r\n");
+        assert_eq!(session.input, "");
+        assert_eq!(session.log_text(), "[hidden input]\r\n");
+        assert!(!session.hide_input, "hide_input is a one-shot, not a standing mode");
+    }
+
+    #[test]
+    fn hidden_tab_prefix_logs_a_placeholder_instead_of_the_partial_line() {
+        let (mut session, sent) = recording_session();
+        session.input = "super-secret".to_string();
+        session.hide_input = true;
+
+        session.send_control(ControlKey::Tab);
+
+        assert_eq!(*sent.lock().unwrap(), b"super-secret\t");
+        assert_eq!(session.log_text(), "[hidden input]");
+        // Tab's echo has no trailing newline (see the non-hidden Tab test above).
     }
 
     #[test]
