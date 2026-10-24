@@ -1,15 +1,15 @@
 # rust-term-console
 
-A Tera Term–like terminal console, in Rust, for **SSH sessions and serial
-ports** — one native window, one codebase, Windows/macOS/Linux.
+A Tera Term–like terminal console, in Rust, for **SSH, Telnet and serial
+port sessions** — one native window, one codebase, Windows/macOS/Linux.
 
 Originally scoped as a TUI per `spec.md`'s FR-6/4.2; rebuilt as a native
 windowed GUI (`egui`/`eframe`) instead, matching FR-O5 / Phase 4 of the
 roadmap ahead of schedule, so the connect flow looks like Tera Term's own
 dialog rather than command-line flags. A transport-agnostic `Connection`
-trait keeps the serial and SSH backends sharing one poll loop, in a modular
-layout (`app.rs` / `ui.rs` / `serial.rs` / `ssh.rs` / `config.rs` /
-`main.rs`).
+trait keeps the serial, SSH and Telnet backends sharing one poll loop, in
+a modular layout (`app.rs` / `ui.rs` / `serial.rs` / `ssh.rs` /
+`telnet.rs` / `config.rs` / `main.rs`).
 
 ## Build
 
@@ -81,17 +81,24 @@ forever — see "Known limitations" below.
 
 **Connect screen** (FR-2, FR-3, FR-O4):
 
-- Choose **SSH** or **Serial** with the radio buttons at the top.
+- Choose **SSH**, **Telnet**, or **Serial** with the radio buttons at the
+  top.
 - SSH: enter host/port/username, then pick Password, Key file, or ssh-agent
   authentication.
+- Telnet: just host/port (23 by default) — there's no authentication at
+  this layer; a login prompt, if any, is plain text sent by the remote,
+  same as a real telnet client. The session negotiates nothing and refuses
+  every option the server offers (`WILL`) or requests (`DO`), staying in
+  plain NVT mode — see "Known limitations" for what that means in
+  practice.
 - Serial: pick a port from the dropdown (**Refresh** re-scans — Windows
   `COM1`/`COM2`/...; macOS `/dev/cu.usbserial-*`/`/dev/tty.usbserial-*`;
   Linux `/dev/ttyUSB*`/`/dev/ttyACM*`/`/dev/ttyS*`, may need
   `sudo usermod -aG dialout $USER`), then baud/data bits/parity/stop
   bits/flow control.
 - Pick the newline mode appended when you press Enter: CRLF / LF / raw.
-- **Profiles**: save the non-secret fields (host/port/username or
-  port/baud + newline) under a name and reload them later from the
+- **Profiles**: save the non-secret fields (host/port/username, host/port,
+  or port/baud — plus newline) under a name and reload them later from the
   dropdown. Passwords/passphrases are never stored — you'll always be
   prompted. Stored at `~/.config/rust-term-console/profiles.toml` (or the
   OS-appropriate config dir).
@@ -127,25 +134,33 @@ forever — see "Known limitations" below.
 ## Architecture notes
 
 - `connection.rs` defines the `Connection` trait (`read_available`,
-  `write_all`, `describe`, `close`) that both transports implement, plus
-  `NewlineMode` and `ControlKey` (the raw bytes behind Ctrl+C/D/Z, Tab,
-  Esc).
+  `write_all`, `describe`, `close`) that all three transports implement,
+  plus `NewlineMode`, `ControlKey` (the raw bytes behind Ctrl+C/D/Z, Tab,
+  Esc) and `connect_tcp_with_timeout` (shared by `ssh.rs`/`telnet.rs`: it
+  resolves the host and tries `TcpStream::connect_timeout` on each
+  address, since plain `TcpStream::connect` has no timeout at all — against
+  a host that drops packets rather than refusing the connection, that
+  would otherwise mean waiting out the OS's own retransmission timeout
+  instead, commonly a minute or more).
 - Remote terminal size follows the window: each frame the log area's size
   is measured in monospace characters, and once it has held still for
   200 ms `Session` sends it via `Connection::resize` (SSH
-  `request_pty_size`; a no-op on serial). So `ls`, `top`, long prompts etc.
-  wrap at the window's width rather than a fixed 120 columns.
+  `request_pty_size`; a no-op on serial and Telnet). So `ls`, `top`, long
+  prompts etc. wrap at the window's width rather than a fixed 120 columns
+  over SSH.
 - `serial.rs` wraps `serialport` with a short read timeout so polling never
   blocks the UI thread.
-- `ssh.rs` wraps `ssh2`: TCP connect → handshake → password/key/agent auth →
-  PTY + shell channel, then switches the session to non-blocking mode for
-  the same poll-driven reads. The TCP connect has an explicit 10s timeout
-  (`connect_with_timeout`, resolving the host and trying
-  `TcpStream::connect_timeout` on each address) — plain `TcpStream::connect`
-  has none, and against a host that drops packets rather than refusing the
-  connection, that can mean waiting out the OS's own retransmission
-  timeout instead (commonly a minute or more). The handshake/auth steps
-  after that aren't bounded this way — see "Known limitations".
+- `ssh.rs` wraps `ssh2`: TCP connect (10s timeout) → handshake →
+  password/key/agent auth → PTY + shell channel, then switches the session
+  to non-blocking mode for the same poll-driven reads. The handshake/auth
+  steps aren't bounded by that timeout — see "Known limitations".
+- `telnet.rs` is a plain TCP connection (10s connect timeout, same as SSH)
+  plus a small stateful parser for Telnet's `IAC` command sequences
+  (mirrors `AnsiFilter`'s approach to ANSI escapes: a sequence split across
+  two reads is still recognized). It refuses every option the server
+  offers (`WILL`) or requests (`DO`) — see "Known limitations" for what
+  that means in practice — and discards subnegotiation payloads for
+  options it never agreed to in the first place.
 - `app.rs` holds `ConnectForm` (the dialog's fields and profile
   load/save/connect logic) and `Session` (log buffer capped at 2 MB, input
   line, sent-line history capped at 500 entries, connection status) — both
@@ -201,13 +216,21 @@ Matches the spec's phased roadmap — not yet implemented:
   on the UI thread (unlike connecting, which now runs in the background),
   so a slow (if bounded) script still briefly freezes the window.
 - Multiple concurrent connections / tabs (FR-O2).
-- Telnet transport (FR-O1 covers SSH only so far).
+- Telnet always negotiates plain NVT mode, refusing every option (FR-O1 is
+  done, but see `telnet.rs`): no character-at-a-time input (the input bar
+  sends whole lines either way, so this matches how SSH/serial already
+  work here), no local echo suppression (a password prompt over Telnet
+  will show what you type — there's no way around this without
+  negotiating `ECHO`, which would need per-keystroke sending to implement
+  properly), and no window-size negotiation (`NAWS`), so remote-side
+  wrapping to the window's width — which SSH gets via `request_pty_size` —
+  doesn't happen over Telnet.
 - Full-screen interactive programs over the connection (vim, htop, less,
   etc.) won't render correctly — the log is plain text, not a real
   cursor-addressed terminal grid.
 - **Cancel** on a connect attempt only stops *waiting* on it in the UI;
-  the background thread isn't killed. The TCP connect itself is bounded
-  (see `ssh.rs`'s `CONNECT_TIMEOUT`), but the SSH handshake/auth and the
-  serial port open that can follow are not, so a cancelled attempt can
-  still run a while longer in the background (harmlessly — its result is
-  just discarded).
+  the background thread isn't killed. The initial TCP connect is bounded
+  (`connect_tcp_with_timeout`, used by both SSH and Telnet), but the SSH
+  handshake/auth and the serial port open that can follow are not, so a
+  cancelled attempt can still run a while longer in the background
+  (harmlessly — its result is just discarded).

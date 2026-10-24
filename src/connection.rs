@@ -1,9 +1,12 @@
 //! Transport-agnostic connection abstraction.
 //!
-//! `serial.rs` and `ssh.rs` each provide a `Connection` implementation so
-//! `app.rs`/`main.rs` can drive either transport through the same loop.
+//! `serial.rs`, `ssh.rs` and `telnet.rs` each provide a `Connection`
+//! implementation so `app.rs`/`main.rs` can drive any transport through the
+//! same loop.
 
 use std::io;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 /// A live, byte-oriented session (serial port or SSH shell channel).
 ///
@@ -108,5 +111,59 @@ impl std::str::FromStr for NewlineMode {
             "crlf" => Ok(NewlineMode::CrLf),
             other => anyhow::bail!("unknown newline mode '{other}' (expected none|lf|crlf)"),
         }
+    }
+}
+
+/// Resolve `addr` ("host:port") and connect to the first address that
+/// accepts within `timeout`. Shared by the SSH and Telnet transports,
+/// which both open a plain TCP connection before doing anything else.
+///
+/// `TcpStream::connect` alone has no timeout: against a host that drops
+/// packets rather than refusing the connection, that means waiting out the
+/// OS's own retransmission timeout instead (commonly a minute or more).
+/// `TcpStream::connect_timeout` bounds that, but only takes a single
+/// resolved `SocketAddr`, not a hostname — so `connect`'s "try each
+/// resolved address in turn" behavior has to be done by hand here.
+pub fn connect_tcp_with_timeout(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
+    let mut last_err = None;
+    for socket_addr in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&socket_addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses to connect to")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn refused_connection_fails_fast_not_after_the_full_timeout() {
+        // Nothing listens on port 1; the OS refuses it almost immediately,
+        // well before a generous 5s timeout would ever matter.
+        let start = Instant::now();
+        let result = connect_tcp_with_timeout("127.0.0.1:1", Duration::from_secs(5));
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(1), "a refused connection should not wait out the timeout");
+    }
+
+    #[test]
+    fn unreachable_host_does_not_hang_past_the_timeout() {
+        // 10.255.255.1 is routed nowhere here, so packets are dropped
+        // rather than refused: without an explicit timeout this is exactly
+        // the case that would otherwise hang on the OS's own (much longer,
+        // often a minute or more) retransmission timeout.
+        let start = Instant::now();
+        let result = connect_tcp_with_timeout("10.255.255.1:9", Duration::from_millis(300));
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(5), "connect_tcp_with_timeout should bound how long it waits");
+    }
+
+    #[test]
+    fn invalid_host_is_an_error_not_a_panic() {
+        assert!(connect_tcp_with_timeout("this is not a valid host:name", Duration::from_secs(1)).is_err());
     }
 }

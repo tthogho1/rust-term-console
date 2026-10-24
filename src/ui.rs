@@ -48,17 +48,19 @@ pub fn draw_connect(ui: &mut egui::Ui, form: &mut ConnectForm, connecting: bool)
 
 fn draw_connect_form(ui: &mut egui::Ui, form: &mut ConnectForm, connecting: bool, action: &mut ConnectAction) {
     ui.heading("Connection");
-    ui.label("Connect over SSH or a serial port.");
+    ui.label("Connect over SSH, Telnet, or a serial port.");
     ui.separator();
 
     ui.horizontal(|ui| {
         ui.radio_value(&mut form.mode, ConnMode::Ssh, "SSH");
+        ui.radio_value(&mut form.mode, ConnMode::Telnet, "Telnet");
         ui.radio_value(&mut form.mode, ConnMode::Serial, "Serial");
     });
     ui.add_space(8.0);
 
     match form.mode {
         ConnMode::Ssh => draw_ssh_fields(ui, form),
+        ConnMode::Telnet => draw_telnet_fields(ui, form),
         ConnMode::Serial => draw_serial_fields(ui, form),
     }
 
@@ -144,6 +146,22 @@ fn draw_ssh_fields(ui: &mut egui::Ui, form: &mut ConnectForm) {
             }
             AuthMode::Agent => {}
         }
+    });
+}
+
+fn draw_telnet_fields(ui: &mut egui::Ui, form: &mut ConnectForm) {
+    ui.label(
+        RichText::new("No authentication at this layer — any login prompt is plain text from the remote.")
+            .weak(),
+    );
+    egui::Grid::new("telnet_grid").num_columns(2).show(ui, |ui| {
+        ui.label("Host");
+        ui.text_edit_singleline(&mut form.host);
+        ui.end_row();
+
+        ui.label("Port");
+        ui.text_edit_singleline(&mut form.telnet_port);
+        ui.end_row();
     });
 }
 

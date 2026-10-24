@@ -23,6 +23,11 @@ pub enum Profile {
         username: String,
         newline: String,
     },
+    Telnet {
+        host: String,
+        port: u16,
+        newline: String,
+    },
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

@@ -11,6 +11,7 @@ use crate::connection::{Connection, ControlKey, NewlineMode};
 use crate::logfile::LogFile;
 use crate::serial::{self, SerialConfig};
 use crate::ssh::{SshAuth, SshConfig, SshConnection};
+use crate::telnet::{TelnetConfig, TelnetConnection};
 use crate::timestamp::{self, LineStamper};
 
 /// Cap on retained output so long-running sessions stay bounded (NFR-4).
@@ -27,6 +28,7 @@ const MAX_HISTORY: usize = 500;
 pub enum ConnMode {
     Serial,
     Ssh,
+    Telnet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,9 @@ pub struct ConnectForm {
     pub auth_mode: AuthMode,
     pub password: String,
     pub key_path: String,
+
+    // Telnet fields (FR-O1). Shares `host` with SSH above.
+    pub telnet_port: String,
 
     pub newline: NewlineMode,
 
@@ -90,6 +95,7 @@ impl Default for ConnectForm {
             auth_mode: AuthMode::Password,
             password: String::new(),
             key_path: String::new(),
+            telnet_port: "23".to_string(),
             newline: NewlineMode::CrLf,
             log_enabled: false,
             log_path: String::new(),
@@ -127,6 +133,12 @@ impl ConnectForm {
                 self.username = username;
                 self.newline = newline.parse().unwrap_or(NewlineMode::CrLf);
             }
+            Ok(Profile::Telnet { host, port, newline }) => {
+                self.mode = ConnMode::Telnet;
+                self.host = host;
+                self.telnet_port = port.to_string();
+                self.newline = newline.parse().unwrap_or(NewlineMode::CrLf);
+            }
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -162,6 +174,14 @@ impl ConnectForm {
                     )
                 },
             ),
+            ConnMode::Telnet => self.telnet_port.parse::<u16>().map_err(anyhow::Error::from).and_then(
+                |port| {
+                    config::save_profile(
+                        &self.profile_name,
+                        Profile::Telnet { host: self.host.clone(), port, newline: self.newline.label().to_string() },
+                    )
+                },
+            ),
         };
         match result {
             Ok(()) => {
@@ -183,6 +203,7 @@ impl ConnectForm {
         match self.mode {
             ConnMode::Serial => self.build_serial_target(),
             ConnMode::Ssh => self.build_ssh_target(),
+            ConnMode::Telnet => self.build_telnet_target(),
         }
     }
 
@@ -238,6 +259,12 @@ impl ConnectForm {
             rows: 32,
         }))
     }
+
+    fn build_telnet_target(&self) -> anyhow::Result<ConnectTarget> {
+        let port: u16 =
+            self.telnet_port.parse().map_err(|_| anyhow::anyhow!("invalid port '{}'", self.telnet_port))?;
+        Ok(ConnectTarget::Telnet(TelnetConfig { host: self.host.clone(), port }))
+    }
 }
 
 /// The blocking part of connecting, split out from `ConnectForm` so it owns
@@ -246,16 +273,19 @@ impl ConnectForm {
 pub enum ConnectTarget {
     Serial(SerialConfig),
     Ssh(SshConfig),
+    Telnet(TelnetConfig),
 }
 
 impl ConnectTarget {
-    /// Does the actual blocking I/O: opening the serial port, or the TCP
-    /// connect + SSH handshake + auth + PTY/shell setup. Safe to call from
-    /// any thread — `Connection: Send` is exactly so this can run here.
+    /// Does the actual blocking I/O: opening the serial port, the TCP
+    /// connect + SSH handshake + auth + PTY/shell setup, or the TCP
+    /// connect for Telnet. Safe to call from any thread — `Connection:
+    /// Send` is exactly so this can run here.
     pub fn open(self) -> anyhow::Result<Box<dyn Connection>> {
         match self {
             ConnectTarget::Serial(config) => Ok(Box::new(crate::serial::SerialConnection::open(config)?)),
             ConnectTarget::Ssh(config) => Ok(Box::new(SshConnection::connect(config)?)),
+            ConnectTarget::Telnet(config) => Ok(Box::new(TelnetConnection::connect(config)?)),
         }
     }
 }
@@ -570,6 +600,11 @@ mod tests {
 
         form.mode = ConnMode::Ssh;
         form.ssh_port = "not a port".to_string();
+        let Err(err) = form.build_target() else { panic!("expected an invalid-port error") };
+        assert!(err.to_string().contains("invalid port"));
+
+        form.mode = ConnMode::Telnet;
+        form.telnet_port = "not a port".to_string();
         let Err(err) = form.build_target() else { panic!("expected an invalid-port error") };
         assert!(err.to_string().contains("invalid port"));
     }

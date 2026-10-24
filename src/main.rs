@@ -9,6 +9,7 @@ mod notebook;
 mod script;
 mod serial;
 mod ssh;
+mod telnet;
 mod timestamp;
 mod ui;
 
