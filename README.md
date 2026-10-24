@@ -139,7 +139,13 @@ forever — see "Known limitations" below.
   blocks the UI thread.
 - `ssh.rs` wraps `ssh2`: TCP connect → handshake → password/key/agent auth →
   PTY + shell channel, then switches the session to non-blocking mode for
-  the same poll-driven reads.
+  the same poll-driven reads. The TCP connect has an explicit 10s timeout
+  (`connect_with_timeout`, resolving the host and trying
+  `TcpStream::connect_timeout` on each address) — plain `TcpStream::connect`
+  has none, and against a host that drops packets rather than refusing the
+  connection, that can mean waiting out the OS's own retransmission
+  timeout instead (commonly a minute or more). The handshake/auth steps
+  after that aren't bounded this way — see "Known limitations".
 - `app.rs` holds `ConnectForm` (the dialog's fields and profile
   load/save/connect logic) and `Session` (log buffer capped at 2 MB, input
   line, sent-line history capped at 500 entries, connection status) — both
@@ -192,15 +198,16 @@ Matches the spec's phased roadmap — not yet implemented:
 - Scripts are send-only: `send()`/`ctrl_c()` etc. queue bytes to go out, but
   a script can't read back the connection's output or the log, so it can't
   branch on a prompt or a command's result. Scripts also run synchronously
-  on the UI thread, so a slow (if bounded) script briefly freezes the
-  window, the same as connecting does.
+  on the UI thread (unlike connecting, which now runs in the background),
+  so a slow (if bounded) script still briefly freezes the window.
 - Multiple concurrent connections / tabs (FR-O2).
 - Telnet transport (FR-O1 covers SSH only so far).
 - Full-screen interactive programs over the connection (vim, htop, less,
   etc.) won't render correctly — the log is plain text, not a real
   cursor-addressed terminal grid.
 - **Cancel** on a connect attempt only stops *waiting* on it in the UI;
-  the background thread isn't killed, and `ssh.rs` sets no connect
-  timeout, so an attempt to an unreachable host can keep running
-  (harmlessly — its result is just discarded) for as long as the OS
-  takes to give up on the TCP connect.
+  the background thread isn't killed. The TCP connect itself is bounded
+  (see `ssh.rs`'s `CONNECT_TIMEOUT`), but the SSH handshake/auth and the
+  serial port open that can follow are not, so a cancelled attempt can
+  still run a while longer in the background (harmlessly — its result is
+  just discarded).
