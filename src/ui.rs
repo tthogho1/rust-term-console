@@ -256,12 +256,18 @@ fn draw_profiles(ui: &mut egui::Ui, form: &mut ConnectForm) {
 
 /// Top header bar: the "Connection" toggle, the "View" and "Log" menus and
 /// connection status.
+// The View menu's checkboxes have grown to tip this over clippy's default
+// limit; the prototype's `show_vt_grid` was the one that pushed it from 7
+// to 8. A real implementation of this experiment would probably want to
+// group these into a settings struct rather than keep adding parameters.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_header(
     ui: &mut egui::Ui,
     session: Option<&mut Session>,
     show_connect: &mut bool,
     show_notebook: &mut bool,
     show_script: &mut bool,
+    show_vt_grid: &mut bool,
     timestamps: &mut bool,
     log_path: &mut String,
 ) -> HeaderAction {
@@ -278,6 +284,11 @@ pub fn draw_header(
                     .on_hover_text("A Rhai script that builds up commands to send");
                 ui.checkbox(timestamps, "Timestamps")
                     .on_hover_text("Prefix each new line with the local time, in the view and the log file");
+                ui.separator();
+                ui.checkbox(show_vt_grid, "Real terminal (experimental)").on_hover_text(
+                    "Prototype: render a real VT100 grid (color, cursor addressing) instead \
+                     of the plain-text log. See README \u{2018}Known limitations\u{2019}.",
+                );
             });
 
             let connected = session.as_ref().is_some_and(|s| s.connected);
@@ -598,7 +609,117 @@ pub fn draw_script(
 }
 
 /// Input bar and scrolling log. `session` is `None` until the first connect.
-pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
+/// Prototype (branch `prototype/vt100-terminal`): paints the vt100
+/// screen's fixed grid of cells directly — color, cursor position, and all
+/// — instead of the plain-text log. This is the piece that a plain
+/// `egui::Label` fundamentally can't do, because full-screen programs
+/// (vim, htop, less) rely on jumping the cursor to an absolute position
+/// and overwriting what's there, not on text just flowing downward. See
+/// `vtgrid.rs` for the parser side and what this prototype leaves out.
+fn draw_vt_grid(ui: &mut egui::Ui, screen: &vt100::Screen) {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let (char_width, row_height) =
+        ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
+    let default_fg = ui.style().visuals.text_color();
+
+    let (rows, cols) = screen.size();
+    let desired_size = egui::vec2(char_width * f32::from(cols.get()), row_height * f32::from(rows.get()));
+    let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, 0.0, ui.style().visuals.extreme_bg_color);
+
+    for row in 0..rows.get() {
+        let y = rect.top() + f32::from(row) * row_height;
+        for col in 0..cols.get() {
+            let Some(cell) = screen.cell(row, col) else { continue };
+            if !cell.has_contents() {
+                continue;
+            }
+            let x = rect.left() + f32::from(col) * char_width;
+            let cell_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(char_width, row_height));
+
+            let (mut fg, mut bg) = (
+                vt100_color_to_egui(cell.fgcolor(), default_fg),
+                vt100_color_to_egui(cell.bgcolor(), egui::Color32::TRANSPARENT),
+            );
+            if cell.inverse() {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            if bg != egui::Color32::TRANSPARENT {
+                painter.rect_filled(cell_rect, 0.0, bg);
+            }
+
+            // Bold/italic aren't reflected here — would need a second
+            // monospace font registered with egui to render properly
+            // rather than just picking a brighter color.
+            painter.text(cell_rect.left_top(), egui::Align2::LEFT_TOP, cell.contents(), font_id.clone(), fg);
+            if cell.underline() {
+                painter.line_segment([cell_rect.left_bottom(), cell_rect.right_bottom()], egui::Stroke::new(1.0, fg));
+            }
+        }
+    }
+
+    if !screen.hide_cursor() {
+        let (cur_row, cur_col) = screen.cursor_position();
+        let x = rect.left() + f32::from(cur_col) * char_width;
+        let y = rect.top() + f32::from(cur_row) * row_height;
+        let cursor_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(char_width, row_height));
+        painter.rect_stroke(
+            cursor_rect,
+            0.0,
+            egui::Stroke::new(1.5, egui::Color32::YELLOW),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
+fn vt100_color_to_egui(color: vt100::Color, default: egui::Color32) -> egui::Color32 {
+    match color {
+        vt100::Color::Default => default,
+        vt100::Color::Idx(i) => ansi_256_color(i),
+        vt100::Color::Rgb(r, g, b) => egui::Color32::from_rgb(r, g, b),
+    }
+}
+
+/// Approximates the standard xterm 16/256-color palette. Good enough for a
+/// prototype; a real implementation would want the exact table (this one's
+/// cube/grayscale math is right, but the 16 basic colors below are a rough
+/// eyeball, not xterm's precise values).
+fn ansi_256_color(i: u8) -> egui::Color32 {
+    const BASIC: [egui::Color32; 16] = [
+        egui::Color32::from_rgb(0, 0, 0),
+        egui::Color32::from_rgb(170, 0, 0),
+        egui::Color32::from_rgb(0, 170, 0),
+        egui::Color32::from_rgb(170, 85, 0),
+        egui::Color32::from_rgb(0, 0, 170),
+        egui::Color32::from_rgb(170, 0, 170),
+        egui::Color32::from_rgb(0, 170, 170),
+        egui::Color32::from_rgb(170, 170, 170),
+        egui::Color32::from_rgb(85, 85, 85),
+        egui::Color32::from_rgb(255, 85, 85),
+        egui::Color32::from_rgb(85, 255, 85),
+        egui::Color32::from_rgb(255, 255, 85),
+        egui::Color32::from_rgb(85, 85, 255),
+        egui::Color32::from_rgb(255, 85, 255),
+        egui::Color32::from_rgb(85, 255, 255),
+        egui::Color32::from_rgb(255, 255, 255),
+    ];
+    match i {
+        0..=15 => BASIC[i as usize],
+        232..=255 => {
+            let level = 8 + (i - 232) * 10;
+            egui::Color32::from_gray(level)
+        }
+        _ => {
+            let i = i - 16;
+            let scale = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            egui::Color32::from_rgb(scale(i / 36), scale((i / 6) % 6), scale(i % 6))
+        }
+    }
+}
+
+pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>, show_vt_grid: bool) {
     egui::Panel::bottom("input_bar").show(ui, |ui| {
         ui.horizontal(|ui| match session.as_deref_mut() {
             Some(session) => {
@@ -714,12 +835,25 @@ pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>) {
         {
             let (cols, rows) = log_area_size_in_chars(ui);
             session.request_resize(cols, rows, std::time::Instant::now());
-        }
-        ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-            if let Some(session) = session.as_deref() {
-                ui.add(egui::Label::new(RichText::new(session.log_text()).monospace()).wrap().selectable(true));
+            // Prototype: purely local, so no debounce needed (unlike
+            // telling the *remote* the new size via `flush_resize`).
+            if show_vt_grid {
+                session.vt_resize(cols, rows);
             }
-        });
+        }
+        if show_vt_grid {
+            ScrollArea::both().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                if let Some(session) = session.as_deref() {
+                    draw_vt_grid(ui, session.vt_screen());
+                }
+            });
+        } else {
+            ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                if let Some(session) = session.as_deref() {
+                    ui.add(egui::Label::new(RichText::new(session.log_text()).monospace()).wrap().selectable(true));
+                }
+            });
+        }
     });
 
     if session.is_some_and(|s| s.connected) {

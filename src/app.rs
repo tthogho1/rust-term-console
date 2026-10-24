@@ -298,6 +298,10 @@ pub struct Session {
     /// FR-O3: when set, everything appended to `log` is also written here.
     log_file: Option<LogFile>,
     ansi_filter: AnsiFilter,
+    /// Prototype (branch `prototype/vt100-terminal`): mirrors incoming raw
+    /// bytes into a real terminal grid, alongside (not instead of) the
+    /// plain-text `log` above. See `vtgrid.rs`.
+    vt_grid: crate::vtgrid::TerminalGrid,
     stamper: LineStamper,
     /// Stamp each new line (output and local echo) with the local time.
     pub timestamps: bool,
@@ -334,6 +338,7 @@ impl Session {
             log: Vec::new(),
             log_file: None,
             ansi_filter: AnsiFilter::default(),
+            vt_grid: crate::vtgrid::TerminalGrid::default(),
             stamper: LineStamper::default(),
             timestamps: false,
             input: String::new(),
@@ -413,6 +418,9 @@ impl Session {
         };
         match conn.read_available() {
             Ok(data) if !data.is_empty() => {
+                // Prototype: the real grid wants the raw escape sequences
+                // themselves, unlike the plain-text log below.
+                self.vt_grid.process(&data);
                 let cleaned = self.ansi_filter.filter(&data);
                 self.append_log(&cleaned);
             }
@@ -425,6 +433,19 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Prototype: the current state of the real terminal grid (see
+    /// `vtgrid.rs`), for `ui::draw_vt_grid` to paint.
+    pub fn vt_screen(&self) -> &vt100::Screen {
+        self.vt_grid.screen()
+    }
+
+    /// Prototype: resize the real terminal grid to match the log area.
+    /// Unlike `request_resize` below, this is purely local (no debounce
+    /// needed) — only telling the *remote* the new size goes through that.
+    pub fn vt_resize(&mut self, cols: u32, rows: u32) {
+        self.vt_grid.resize(cols, rows);
     }
 
     /// Note the log area's current size in characters. It is sent to the

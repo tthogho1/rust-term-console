@@ -9,6 +9,7 @@ mod script;
 mod timestamp;
 mod transport;
 mod ui;
+mod vtgrid;
 
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::thread;
@@ -62,6 +63,9 @@ struct GuiApp {
     /// What the script's last run printed/debugged, or the error it hit.
     script_output: String,
     script_error: Option<String>,
+    /// Prototype (branch `prototype/vt100-terminal`): render a real
+    /// terminal grid instead of the plain-text log. See `vtgrid.rs`.
+    show_vt_grid: bool,
 }
 
 impl Default for GuiApp {
@@ -81,6 +85,7 @@ impl Default for GuiApp {
             script_path: String::new(),
             script_output: String::new(),
             script_error: None,
+            show_vt_grid: false,
         }
     }
 }
@@ -226,6 +231,7 @@ impl eframe::App for GuiApp {
             &mut self.show_connect,
             &mut self.show_notebook,
             &mut self.show_script,
+            &mut self.show_vt_grid,
             &mut self.form.timestamps,
             &mut self.form.log_path,
         );
@@ -310,7 +316,7 @@ impl eframe::App for GuiApp {
             }
         }
 
-        ui::draw_terminal(ui, self.session.as_mut());
+        ui::draw_terminal(ui, self.session.as_mut(), self.show_vt_grid);
     }
 }
 
