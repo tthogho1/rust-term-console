@@ -23,7 +23,7 @@ use logfile::LogFile;
 use notebook::Cell;
 use script::ScriptAction;
 use transport::Connection;
-use ui::{ConnectAction, HeaderAction, NotebookAction, ScriptPanelAction};
+use ui::{ConnectAction, HeaderAction, NotebookAction, ScriptPanelAction, TransferPanelAction};
 
 /// A connect attempt running on a background thread (see `GuiApp::connect`),
 /// polled once per frame rather than blocked on.
@@ -63,9 +63,43 @@ struct GuiApp {
     /// What the script's last run printed/debugged, or the error it hit.
     script_output: String,
     script_error: Option<String>,
-    /// Prototype (branch `prototype/vt100-terminal`): render a real
-    /// terminal grid instead of the plain-text log. See `vtgrid.rs`.
+    /// Render a real terminal grid instead of the plain-text log (View →
+    /// Real terminal). See `vtgrid.rs`.
     show_vt_grid: bool,
+    /// Whether the file transfer panel is open. SSH-only (see
+    /// `Session::ssh_session`); the panel says so when it's not available.
+    show_transfer: bool,
+    transfer_form: TransferForm,
+    /// Set while a transfer is running on a background thread.
+    transfer: Option<PendingTransfer>,
+    /// Set when a transfer fails; cleared when one starts or succeeds.
+    transfer_error: Option<String>,
+}
+
+/// The transfer panel's own fields — a local path, a remote path, and
+/// which way the file goes between them.
+struct TransferForm {
+    local_path: String,
+    remote_path: String,
+    /// `true` sends `local_path` to `remote_path`; `false` fetches
+    /// `remote_path` down to `local_path`.
+    upload: bool,
+}
+
+impl Default for TransferForm {
+    fn default() -> Self {
+        Self { local_path: String::new(), remote_path: String::new(), upload: true }
+    }
+}
+
+/// An SCP transfer running on a background thread (see `GuiApp::start_transfer`),
+/// polled once per frame rather than blocked on.
+struct PendingTransfer {
+    receiver: Receiver<transport::scp::Event>,
+    /// What's shown while it runs, e.g. "Uploading foo.txt".
+    label: String,
+    transferred: u64,
+    total: u64,
 }
 
 impl Default for GuiApp {
@@ -86,6 +120,10 @@ impl Default for GuiApp {
             script_output: String::new(),
             script_error: None,
             show_vt_grid: false,
+            show_transfer: false,
+            transfer_form: TransferForm::default(),
+            transfer: None,
+            transfer_error: None,
         }
     }
 }
@@ -208,12 +246,88 @@ impl GuiApp {
             }
         }
     }
+
+    /// Start an SCP transfer as described by the form, on a background
+    /// thread (see `transport::scp::run`) so a large file doesn't block
+    /// the UI — same reasoning as `connect()`. Ignored if one is already
+    /// running, or if the live connection isn't SSH.
+    fn start_transfer(&mut self) {
+        if self.transfer.is_some() {
+            return;
+        }
+        let Some(session) = self.session.as_ref() else {
+            self.transfer_error = Some("Not connected".to_string());
+            return;
+        };
+        let Some(ssh_session) = session.ssh_session() else {
+            self.transfer_error = Some("File transfer needs an SSH connection".to_string());
+            return;
+        };
+        if self.transfer_form.local_path.trim().is_empty() || self.transfer_form.remote_path.trim().is_empty() {
+            self.transfer_error = Some("Enter both a local and a remote path".to_string());
+            return;
+        }
+
+        let local = std::path::PathBuf::from(self.transfer_form.local_path.trim());
+        let remote = std::path::PathBuf::from(self.transfer_form.remote_path.trim());
+        let (label, direction) = if self.transfer_form.upload {
+            (format!("Uploading {}", local.display()), transport::scp::Direction::Upload { local, remote })
+        } else {
+            (format!("Downloading {}", remote.display()), transport::scp::Direction::Download { remote, local })
+        };
+
+        self.transfer_error = None;
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            transport::scp::run(&ssh_session, &direction, |event| {
+                let _ = tx.send(event);
+            });
+        });
+        self.transfer = Some(PendingTransfer { receiver: rx, label, transferred: 0, total: 0 });
+    }
+
+    /// Check on an in-flight transfer without blocking. Call once per
+    /// frame; does nothing if there isn't one. Drains every event queued
+    /// this frame (not just the first) so a burst of `Progress` events
+    /// from a fast local copy doesn't trickle in over several frames.
+    fn poll_transfer(&mut self) {
+        let Some(pending) = self.transfer.as_mut() else {
+            return;
+        };
+        loop {
+            match pending.receiver.try_recv() {
+                Ok(transport::scp::Event::Progress { transferred, total }) => {
+                    pending.transferred = transferred;
+                    pending.total = total;
+                }
+                Ok(transport::scp::Event::Done) => {
+                    self.transfer = None;
+                    self.transfer_error = None;
+                    return;
+                }
+                Ok(transport::scp::Event::Failed(message)) => {
+                    self.transfer = None;
+                    self.transfer_error = Some(message);
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    // The sending thread panicked without sending; don't
+                    // leave the panel stuck showing progress forever.
+                    self.transfer = None;
+                    self.transfer_error = Some("Transfer ended unexpectedly".to_string());
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_connect();
-        if self.connecting.is_some() {
+        self.poll_transfer();
+        if self.connecting.is_some() || self.transfer.is_some() {
             // Keep polling even without mouse/keyboard input, same reason
             // draw_terminal does this while connected (see below).
             ui.ctx().request_repaint_after(Duration::from_millis(50));
@@ -232,6 +346,7 @@ impl eframe::App for GuiApp {
             &mut self.show_notebook,
             &mut self.show_script,
             &mut self.show_vt_grid,
+            &mut self.show_transfer,
             &mut self.form.timestamps,
             &mut self.form.log_path,
         );
@@ -313,6 +428,26 @@ impl eframe::App for GuiApp {
                     }
                     Err(e) => self.script_error = Some(format!("{e:#}")),
                 },
+            }
+        }
+
+        if self.show_transfer {
+            let can_transfer = self.session.as_ref().is_some_and(|s| s.ssh_session().is_some());
+            let progress = self
+                .transfer
+                .as_ref()
+                .map(|t| (t.label.as_str(), t.transferred, t.total));
+            let action = ui::draw_transfer(
+                ui,
+                &mut self.transfer_form.local_path,
+                &mut self.transfer_form.remote_path,
+                &mut self.transfer_form.upload,
+                progress,
+                self.transfer_error.as_deref(),
+                can_transfer,
+            );
+            if let TransferPanelAction::Start = action {
+                self.start_transfer();
             }
         }
 

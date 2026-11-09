@@ -3,6 +3,7 @@
 //! `Connection` implementation so `app.rs`/`main.rs` can drive any
 //! transport through the same loop.
 
+pub mod scp;
 pub mod serial;
 pub mod ssh;
 pub mod telnet;
@@ -37,6 +38,21 @@ pub trait Connection: Send {
 
     /// Best-effort clean shutdown. Errors are logged, not propagated.
     fn close(&mut self);
+
+    /// A handle onto the same underlying SSH session, if this is one, for
+    /// `transport::scp` to run a file transfer over — reusing the already-
+    /// authenticated session rather than opening a second connection, the
+    /// same way Tera Term's own SSH SCP feature does. `ssh2::Session` is
+    /// cheaply `Clone` (it's an `Arc` internally); serial and Telnet have
+    /// no equivalent, hence the default.
+    ///
+    /// This is the one place the transport-agnostic `Connection` trait
+    /// knows about a specific transport's types — a deliberately small
+    /// exception rather than building a general capability-downcasting
+    /// mechanism for a single feature.
+    fn clone_ssh_session(&self) -> Option<ssh2::Session> {
+        None
+    }
 }
 
 /// Line ending to append when the user presses Enter.

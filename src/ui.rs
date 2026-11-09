@@ -257,9 +257,9 @@ fn draw_profiles(ui: &mut egui::Ui, form: &mut ConnectForm) {
 /// Top header bar: the "Connection" toggle, the "View" and "Log" menus and
 /// connection status.
 // The View menu's checkboxes have grown to tip this over clippy's default
-// limit; the prototype's `show_vt_grid` was the one that pushed it from 7
-// to 8. A real implementation of this experiment would probably want to
-// group these into a settings struct rather than keep adding parameters.
+// limit; `show_vt_grid` was the one that pushed it from 7 to 8. Grouping
+// these into a settings struct would be the natural fix if another one
+// gets added.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_header(
     ui: &mut egui::Ui,
@@ -268,6 +268,7 @@ pub fn draw_header(
     show_notebook: &mut bool,
     show_script: &mut bool,
     show_vt_grid: &mut bool,
+    show_transfer: &mut bool,
     timestamps: &mut bool,
     log_path: &mut String,
 ) -> HeaderAction {
@@ -282,12 +283,15 @@ pub fn draw_header(
                 ui.checkbox(show_notebook, "Notebook");
                 ui.checkbox(show_script, "Script")
                     .on_hover_text("A Rhai script that builds up commands to send");
+                ui.checkbox(show_transfer, "Transfer")
+                    .on_hover_text("Send or fetch a file over SCP (SSH connections only)");
                 ui.checkbox(timestamps, "Timestamps")
                     .on_hover_text("Prefix each new line with the local time, in the view and the log file");
                 ui.separator();
-                ui.checkbox(show_vt_grid, "Real terminal (experimental)").on_hover_text(
-                    "Prototype: render a real VT100 grid (color, cursor addressing) instead \
-                     of the plain-text log. See README \u{2018}Known limitations\u{2019}.",
+                ui.checkbox(show_vt_grid, "Real terminal").on_hover_text(
+                    "Render a real VT100 grid (color, cursor addressing, scrollback) instead \
+                     of the plain-text log, so full-screen programs like vim/htop/less work. \
+                     Scroll with the mouse wheel over it. See README \u{2018}Known limitations\u{2019}.",
                 );
             });
 
@@ -608,70 +612,266 @@ pub fn draw_script(
     action
 }
 
+pub enum TransferPanelAction {
+    None,
+    /// Transfer button pressed; the caller starts it on a background
+    /// thread (see `transport::scp`).
+    Start,
+}
+
+/// SCP file transfer, drawn as a right side panel. Call only while it is
+/// shown. `can_transfer` is false unless the live connection is SSH (SCP
+/// has no equivalent over serial or Telnet) — see `Session::ssh_session`.
+/// `progress` is `Some((label, transferred, total))` while a transfer
+/// from a previous `Start` is running; the path/direction fields and
+/// Transfer button are replaced by a progress bar until it finishes.
+pub fn draw_transfer(
+    ui: &mut egui::Ui,
+    local_path: &mut String,
+    remote_path: &mut String,
+    upload: &mut bool,
+    progress: Option<(&str, u64, u64)>,
+    error: Option<&str>,
+    can_transfer: bool,
+) -> TransferPanelAction {
+    let mut action = TransferPanelAction::None;
+
+    egui::Panel::right("transfer_panel").default_size(340.0).show(ui, |ui| {
+        ui.heading("Transfer");
+        ui.label(
+            "Send or fetch a single file over SCP, reusing the current SSH connection \
+             rather than opening a new one — the same thing Tera Term's SSH SCP does.",
+        );
+        ui.separator();
+
+        let transferring = progress.is_some();
+        ui.add_enabled_ui(!transferring, |ui| {
+            ui.horizontal(|ui| {
+                ui.radio_value(upload, true, "Upload");
+                ui.radio_value(upload, false, "Download");
+            });
+            ui.add_space(4.0);
+
+            egui::Grid::new("transfer_grid").num_columns(2).show(ui, |ui| {
+                ui.label("Local path");
+                ui.text_edit_singleline(local_path);
+                ui.end_row();
+
+                ui.label("Remote path");
+                ui.text_edit_singleline(remote_path);
+                ui.end_row();
+            });
+        });
+
+        ui.add_space(8.0);
+        if let Some(err) = error {
+            ui.colored_label(Color32::from_rgb(220, 60, 60), err);
+        }
+
+        if let Some((label, transferred, total)) = progress {
+            ui.label(label);
+            let fraction = if total > 0 { transferred as f32 / total as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(fraction).text(format!("{transferred} / {total} bytes")));
+        } else {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(can_transfer, egui::Button::new("Transfer")).clicked() {
+                    action = TransferPanelAction::Start;
+                }
+                if !can_transfer {
+                    ui.label(RichText::new("Needs an SSH connection").weak());
+                }
+            });
+        }
+    });
+
+    action
+}
+
 /// Input bar and scrolling log. `session` is `None` until the first connect.
-/// Prototype (branch `prototype/vt100-terminal`): paints the vt100
-/// screen's fixed grid of cells directly — color, cursor position, and all
-/// — instead of the plain-text log. This is the piece that a plain
+/// "View → Real terminal" (see `vtgrid.rs`) paints the vt100 screen's
+/// fixed grid of cells directly — color, cursor position, scrollback, and
+/// all — instead of the plain-text log. This is the piece that a plain
 /// `egui::Label` fundamentally can't do, because full-screen programs
 /// (vim, htop, less) rely on jumping the cursor to an absolute position
-/// and overwriting what's there, not on text just flowing downward. See
-/// `vtgrid.rs` for the parser side and what this prototype leaves out.
-fn draw_vt_grid(ui: &mut egui::Ui, screen: &vt100::Screen) {
+/// and overwriting what's there, not on text just flowing downward.
+fn draw_vt_grid(ui: &mut egui::Ui, session: &mut Session) {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let (char_width, row_height) =
         ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
     let default_fg = ui.style().visuals.text_color();
 
-    let (rows, cols) = screen.size();
+    let (rows, cols) = session.vt_screen().size();
     let desired_size = egui::vec2(char_width * f32::from(cols.get()), row_height * f32::from(rows.get()));
-    let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
-    let painter = ui.painter_at(rect);
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
+    // The mouse wheel scrolls vt100's own scrollback offset directly,
+    // rather than wrapping this in an `egui::ScrollArea`: vt100 already
+    // tracks history and reflows the fixed-size grid to show any offset
+    // into it (see `vtgrid.rs::TerminalGrid::process`), so moving that
+    // offset is the whole job.
+    if response.hovered() {
+        let rows_scrolled = ui.input(|i| i.smooth_scroll_delta.y) / row_height;
+        if rows_scrolled.abs() >= 0.5 {
+            session.vt_scroll_by(-rows_scrolled.round() as i64);
+        }
+    }
+
+    let screen = session.vt_screen();
+    let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, ui.style().visuals.extreme_bg_color);
 
     for row in 0..rows.get() {
         let y = rect.top() + f32::from(row) * row_height;
-        for col in 0..cols.get() {
-            let Some(cell) = screen.cell(row, col) else { continue };
-            if !cell.has_contents() {
-                continue;
-            }
-            let x = rect.left() + f32::from(col) * char_width;
-            let cell_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(char_width, row_height));
+        paint_vt_row(&painter, screen, row, cols.get(), rect.left(), y, char_width, row_height, &font_id, default_fg);
+    }
 
-            let (mut fg, mut bg) = (
-                vt100_color_to_egui(cell.fgcolor(), default_fg),
-                vt100_color_to_egui(cell.bgcolor(), egui::Color32::TRANSPARENT),
-            );
-            if cell.inverse() {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if bg != egui::Color32::TRANSPARENT {
-                painter.rect_filled(cell_rect, 0.0, bg);
-            }
+    // The cursor only reflects where the remote is actually typing, which
+    // is meaningless (and would be actively misleading) while looking at
+    // scrollback history rather than the live tail.
+    let scrolled_back = screen.scrollback() > 0;
+    if !scrolled_back && !screen.hide_cursor() {
+        paint_vt_cursor(&painter, screen, rect.left(), rect.top(), char_width, row_height);
+    }
 
-            // Bold/italic aren't reflected here — would need a second
-            // monospace font registered with egui to render properly
-            // rather than just picking a brighter color.
-            painter.text(cell_rect.left_top(), egui::Align2::LEFT_TOP, cell.contents(), font_id.clone(), fg);
-            if cell.underline() {
-                painter.line_segment([cell_rect.left_bottom(), cell_rect.right_bottom()], egui::Stroke::new(1.0, fg));
-            }
+    if scrolled_back {
+        let label = format!(
+            "\u{23f8} scrolled back {}/{} lines \u{2014} click to jump to the live tail",
+            screen.scrollback(),
+            screen.scrollback_len()
+        );
+        let indicator_rect =
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), row_height.max(18.0)));
+        if ui.put(indicator_rect, egui::Button::new(RichText::new(label).small())).clicked() {
+            session.vt_jump_to_live_tail();
         }
     }
+}
 
-    if !screen.hide_cursor() {
-        let (cur_row, cur_col) = screen.cursor_position();
-        let x = rect.left() + f32::from(cur_col) * char_width;
-        let y = rect.top() + f32::from(cur_row) * row_height;
-        let cursor_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(char_width, row_height));
-        painter.rect_stroke(
-            cursor_rect,
-            0.0,
-            egui::Stroke::new(1.5, egui::Color32::YELLOW),
-            egui::StrokeKind::Outside,
+/// A cell's paintable attributes with inverse video already resolved into
+/// actual (fg, bg) — cells with identical style in a row are merged into
+/// one `painter.text`/`rect_filled` call pair rather than one per
+/// character, since shell output is usually long runs of the same
+/// default styling.
+#[derive(PartialEq, Clone, Copy)]
+struct VtCellStyle {
+    fg: egui::Color32,
+    bg: egui::Color32,
+    bold: bool,
+    underline: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_vt_row(
+    painter: &egui::Painter,
+    screen: &vt100::Screen,
+    row: u16,
+    cols: u16,
+    left: f32,
+    y: f32,
+    char_width: f32,
+    row_height: f32,
+    font_id: &egui::FontId,
+    default_fg: egui::Color32,
+) {
+    let mut run_start = 0u16;
+    let mut run_style: Option<VtCellStyle> = None;
+    let mut run_text = String::new();
+
+    let mut col = 0u16;
+    while col < cols {
+        let Some(cell) = screen.cell(row, col) else { break };
+        // The second half of a double-width (e.g. CJK) character; the
+        // glyph was already painted as part of the first half's cell, in
+        // a font where it should already render at double width.
+        if cell.is_wide_continuation() {
+            col += 1;
+            continue;
+        }
+
+        let (mut fg, mut bg) = (
+            vt100_color_to_egui(cell.fgcolor(), default_fg),
+            vt100_color_to_egui(cell.bgcolor(), egui::Color32::TRANSPARENT),
         );
+        if cell.inverse() {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        let style = VtCellStyle { fg, bg, bold: cell.bold(), underline: cell.underline() };
+        let text = if cell.contents().is_empty() { " " } else { cell.contents() };
+
+        match run_style {
+            Some(s) if s == style => run_text.push_str(text),
+            Some(s) => {
+                paint_vt_run(painter, left, y, run_start, col, char_width, row_height, font_id, s, &run_text);
+                run_style = Some(style);
+                run_text.clear();
+                run_text.push_str(text);
+                run_start = col;
+            }
+            None => {
+                run_style = Some(style);
+                run_text.push_str(text);
+                run_start = col;
+            }
+        }
+        col += 1;
     }
+    if let Some(s) = run_style {
+        paint_vt_run(painter, left, y, run_start, cols, char_width, row_height, font_id, s, &run_text);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_vt_run(
+    painter: &egui::Painter,
+    left: f32,
+    y: f32,
+    start_col: u16,
+    end_col: u16,
+    char_width: f32,
+    row_height: f32,
+    font_id: &egui::FontId,
+    style: VtCellStyle,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let x = left + f32::from(start_col) * char_width;
+    let width = f32::from(end_col - start_col) * char_width;
+    let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, row_height));
+
+    if style.bg != egui::Color32::TRANSPARENT {
+        painter.rect_filled(rect, 0.0, style.bg);
+    }
+    if !text.trim().is_empty() {
+        painter.text(rect.left_top(), egui::Align2::LEFT_TOP, text, font_id.clone(), style.fg);
+        if style.bold {
+            // egui only bundles one (regular-weight) monospace font by
+            // default, so there's no real bold face to switch to;
+            // approximate it with a second copy offset by a fraction of
+            // a pixel rather than e.g. brightening the color, which
+            // wouldn't make sense for an arbitrary RGB color.
+            painter.text(rect.left_top() + egui::vec2(0.4, 0.0), egui::Align2::LEFT_TOP, text, font_id.clone(), style.fg);
+        }
+    }
+    if style.underline {
+        painter.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0, style.fg));
+    }
+}
+
+fn paint_vt_cursor(
+    painter: &egui::Painter,
+    screen: &vt100::Screen,
+    left: f32,
+    top: f32,
+    char_width: f32,
+    row_height: f32,
+) {
+    let (cur_row, cur_col) = screen.cursor_position();
+    let x = left + f32::from(cur_col) * char_width;
+    let y = top + f32::from(cur_row) * row_height;
+    let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(char_width, row_height));
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, egui::Color32::YELLOW), egui::StrokeKind::Outside);
 }
 
 fn vt100_color_to_egui(color: vt100::Color, default: egui::Color32) -> egui::Color32 {
@@ -682,28 +882,30 @@ fn vt100_color_to_egui(color: vt100::Color, default: egui::Color32) -> egui::Col
     }
 }
 
-/// Approximates the standard xterm 16/256-color palette. Good enough for a
-/// prototype; a real implementation would want the exact table (this one's
-/// cube/grayscale math is right, but the 16 basic colors below are a rough
-/// eyeball, not xterm's precise values).
+/// The standard xterm 256-color palette: entries 0-15 are xterm's documented
+/// default RGB values for the basic/bright ANSI colors (a terminal with a
+/// customized palette, which many users set up, won't exactly match —
+/// there's no way to know that from the SGR color-index codes alone);
+/// 16-231 are the 6×6×6 color cube and 232-255 the grayscale ramp, both
+/// exact per the xterm spec.
 fn ansi_256_color(i: u8) -> egui::Color32 {
     const BASIC: [egui::Color32; 16] = [
-        egui::Color32::from_rgb(0, 0, 0),
-        egui::Color32::from_rgb(170, 0, 0),
-        egui::Color32::from_rgb(0, 170, 0),
-        egui::Color32::from_rgb(170, 85, 0),
-        egui::Color32::from_rgb(0, 0, 170),
-        egui::Color32::from_rgb(170, 0, 170),
-        egui::Color32::from_rgb(0, 170, 170),
-        egui::Color32::from_rgb(170, 170, 170),
-        egui::Color32::from_rgb(85, 85, 85),
-        egui::Color32::from_rgb(255, 85, 85),
-        egui::Color32::from_rgb(85, 255, 85),
-        egui::Color32::from_rgb(255, 255, 85),
-        egui::Color32::from_rgb(85, 85, 255),
-        egui::Color32::from_rgb(255, 85, 255),
-        egui::Color32::from_rgb(85, 255, 255),
-        egui::Color32::from_rgb(255, 255, 255),
+        egui::Color32::from_rgb(0x00, 0x00, 0x00),
+        egui::Color32::from_rgb(0xCD, 0x00, 0x00),
+        egui::Color32::from_rgb(0x00, 0xCD, 0x00),
+        egui::Color32::from_rgb(0xCD, 0xCD, 0x00),
+        egui::Color32::from_rgb(0x00, 0x00, 0xEE),
+        egui::Color32::from_rgb(0xCD, 0x00, 0xCD),
+        egui::Color32::from_rgb(0x00, 0xCD, 0xCD),
+        egui::Color32::from_rgb(0xE5, 0xE5, 0xE5),
+        egui::Color32::from_rgb(0x7F, 0x7F, 0x7F),
+        egui::Color32::from_rgb(0xFF, 0x00, 0x00),
+        egui::Color32::from_rgb(0x00, 0xFF, 0x00),
+        egui::Color32::from_rgb(0xFF, 0xFF, 0x00),
+        egui::Color32::from_rgb(0x5C, 0x5C, 0xFF),
+        egui::Color32::from_rgb(0xFF, 0x00, 0xFF),
+        egui::Color32::from_rgb(0x00, 0xFF, 0xFF),
+        egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
     ];
     match i {
         0..=15 => BASIC[i as usize],
@@ -835,18 +1037,21 @@ pub fn draw_terminal(ui: &mut egui::Ui, mut session: Option<&mut Session>, show_
         {
             let (cols, rows) = log_area_size_in_chars(ui);
             session.request_resize(cols, rows, std::time::Instant::now());
-            // Prototype: purely local, so no debounce needed (unlike
-            // telling the *remote* the new size via `flush_resize`).
-            if show_vt_grid {
-                session.vt_resize(cols, rows);
-            }
+            // Purely local, so no debounce needed (unlike telling the
+            // *remote* the new size via `flush_resize`) — kept in sync
+            // even while this view isn't the one being shown, so toggling
+            // "Real terminal" on mid-session doesn't show a stale size
+            // for one frame.
+            session.vt_resize(cols, rows);
         }
         if show_vt_grid {
-            ScrollArea::both().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-                if let Some(session) = session.as_deref() {
-                    draw_vt_grid(ui, session.vt_screen());
-                }
-            });
+            // Not wrapped in an `egui::ScrollArea`: it handles its own
+            // scrolling (mouse wheel over it moves vt100's scrollback
+            // offset — see `draw_vt_grid`), since it's a fixed-size grid
+            // rather than content that keeps growing downward.
+            if let Some(session) = session.as_deref_mut() {
+                draw_vt_grid(ui, session);
+            }
         } else {
             ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                 if let Some(session) = session.as_deref() {
