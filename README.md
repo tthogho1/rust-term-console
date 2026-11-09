@@ -77,6 +77,17 @@ forever — see "Known limitations" below.
 
 [Rhai]: https://rhai.rs/
 
+**View → Transfer** opens a right-hand panel for sending or fetching a
+single file over SCP — Tera Term's "SSH SCP..." menu item, equivalently.
+It's SSH-only (there's no SCP over serial or Telnet); the **Transfer**
+button is disabled, with a note why, unless the live connection is SSH.
+Pick **Upload** or **Download**, fill in the local and remote paths, and
+**Transfer**: it reuses the current SSH session as a second channel
+(`transport::scp`) rather than opening a new connection, runs on a
+background thread so a large file doesn't freeze the window, and shows a
+progress bar while it's going. Only one file at a time — no recursive
+directory copy (like Tera Term's own basic SCP feature, not `scp -r`).
+
 ## Using the app
 
 **Connect screen** (FR-2, FR-3, FR-O4):
@@ -113,7 +124,18 @@ forever — see "Known limitations" below.
 
 - Status bar: connection state, target, a live newline-mode selector, and
   status/error messages.
-- Log area: scrollable, auto-follows new output, monospaced.
+- Log area: scrollable, auto-follows new output, monospaced, selectable
+  plain text with ANSI escape sequences stripped (see `ansi.rs` below).
+- **View → Real terminal** swaps the log area for a real VT100 grid
+  (`vtgrid.rs`): color, cursor-addressed redraws, and scrollback, so
+  full-screen programs (`vim`, `htop`, `less`, a shell with a fancy
+  prompt) render the way they would in a real terminal, not just as a
+  stream of lines. Scroll it with the mouse wheel; a bar at the top while
+  scrolled back shows how far and offers a one-click jump back to the
+  live tail (new output keeps arriving underneath without yanking your
+  view back to it, like a real terminal). Toggle back to the plain-text
+  log any time — this doesn't replace it, since the log area stays what
+  the log file, Notebook, and Script actually read from.
 - Input bar: type and press Enter (or click Send) to transmit a line; local
   echo shows what you sent even if the remote doesn't echo it back.
   **↑/↓** recall previously sent lines (from the input bar or a notebook
@@ -169,6 +191,19 @@ forever — see "Known limitations" below.
   offers (`WILL`) or requests (`DO`) — see "Known limitations" for what
   that means in practice — and discards subnegotiation payloads for
   options it never agreed to in the first place.
+- `transport/scp.rs` runs an SCP transfer over `ssh2::Session::scp_send`/
+  `scp_recv`. It needs a `Session` handle, which `Connection` exposes via
+  `clone_ssh_session` (`None` by default; `SshConnection` returns
+  `Some(self.session.clone())` — `ssh2::Session` is `Clone`, an `Arc`
+  internally, so this reuses the live connection's already-authenticated
+  session rather than opening a second one). This is the one place the
+  otherwise transport-agnostic `Connection` trait knows about a specific
+  transport's types, a deliberate small exception rather than a general
+  capability-downcasting mechanism for one feature. Reads/writes retry on
+  `WouldBlock` in small (32 KiB) chunks, the same pattern `SshConnection`
+  itself already uses for its interactive channel — both channels share
+  one underlying session, so holding it for a whole big file at once
+  would stall the interactive terminal too.
 - `app.rs` holds `ConnectForm` (the dialog's fields and profile
   load/save/connect logic) and `Session` (log buffer capped at 2 MB, input
   line, sent-line history capped at 500 entries, connection status) — both
@@ -216,6 +251,22 @@ forever — see "Known limitations" below.
   log, statefully so a sequence split across two reads is still caught.
   Without this, any shell with a themed/colored prompt (the default on
   most systems) would show raw escape-code garbage instead of clean text.
+- `vtgrid.rs` wraps a [`vt100`] parser fed the same incoming bytes
+  *before* `ansi_filter` strips them — vt100 needs the escape sequences
+  themselves to track a real cell grid (text, color, bold/underline,
+  cursor position, 2000 lines of scrollback) the way a terminal emulator
+  would, rather than discarding them. `Session` feeds both the plain
+  `log` and this grid from the same `poll_connection`, so toggling "View
+  → Real terminal" doesn't change what's logged or re-fetch anything.
+  `ui::draw_vt_grid` paints it with `egui::Painter` directly (not
+  `egui::Label`): it run-length-encodes each row into same-style spans
+  before painting, since shell output is usually long runs of identical
+  styling and painting cell-by-cell would be one `Painter` call each.
+  Mouse-wheel scrolling moves vt100's own scrollback offset (`set_scrollback`)
+  rather than wrapping this in an `egui::ScrollArea`, since vt100 already
+  reflows the fixed-size grid to show any offset into its history.
+
+[`vt100`]: https://docs.rs/vt100
 
 ## Known limitations / roadmap
 
@@ -229,6 +280,11 @@ Matches the spec's phased roadmap — not yet implemented:
   on the UI thread (unlike connecting, which now runs in the background),
   so a slow (if bounded) script still briefly freezes the window.
 - Multiple concurrent connections / tabs (FR-O2).
+- Transfer is one file at a time: no recursive directory copy, no
+  queueing a batch of transfers, and no drag-and-drop — fill in the
+  panel's two path fields and click Transfer. Disconnecting (or the
+  remote closing the connection) while a transfer is running will fail
+  it with an error rather than resuming later.
 - Telnet always negotiates plain NVT mode, refusing every option (FR-O1 is
   done, but see `transport/telnet.rs`): no character-at-a-time input (the
   input bar sends whole lines either way, so this matches how SSH/serial
@@ -239,9 +295,18 @@ Matches the spec's phased roadmap — not yet implemented:
   `WILL ECHO`, which we refuse): the **🔒** toggle hides the next line you
   type, but nothing arms it for you, so it's on you to remember to click
   it before a password rather than after.
-- Full-screen interactive programs over the connection (vim, htop, less,
-  etc.) won't render correctly — the log is plain text, not a real
-  cursor-addressed terminal grid.
+- The plain-text log (the default view) can't render full-screen
+  interactive programs (vim, htop, less, etc.) correctly, since it's
+  just lines of text, not a real cursor-addressed grid — switch to
+  **View → Real terminal** for those. That view has its own gaps:
+  bold is a second copy of the text painted a fraction of a pixel over,
+  not an actual bold font face (egui only bundles one, regular-weight,
+  monospace font by default); italic isn't rendered at all, for the same
+  reason; the 16 basic colors are xterm's documented defaults, which
+  won't match if the remote has a customized palette (common in e.g.
+  Solarized-themed shells) — there's no way to detect that from the SGR
+  color-index codes alone; and double-width (e.g. CJK) characters are
+  handled only approximately.
 - **Cancel** on a connect attempt only stops *waiting* on it in the UI;
   the background thread isn't killed. The initial TCP connect is bounded
   (`connect_tcp_with_timeout`, used by both SSH and Telnet), but the SSH

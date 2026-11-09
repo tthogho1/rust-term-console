@@ -298,9 +298,9 @@ pub struct Session {
     /// FR-O3: when set, everything appended to `log` is also written here.
     log_file: Option<LogFile>,
     ansi_filter: AnsiFilter,
-    /// Prototype (branch `prototype/vt100-terminal`): mirrors incoming raw
-    /// bytes into a real terminal grid, alongside (not instead of) the
-    /// plain-text `log` above. See `vtgrid.rs`.
+    /// Mirrors incoming raw bytes into a real terminal grid, alongside
+    /// (not instead of) the plain-text `log` above, for the header's
+    /// "View → Real terminal". See `vtgrid.rs`.
     vt_grid: crate::vtgrid::TerminalGrid,
     stamper: LineStamper,
     /// Stamp each new line (output and local echo) with the local time.
@@ -356,6 +356,15 @@ impl Session {
 
     pub fn connection_label(&self) -> &str {
         &self.connection_label
+    }
+
+    /// A handle onto the live connection's underlying SSH session, for
+    /// `transport::scp` — `None` for serial/Telnet, or if not connected.
+    /// Cheap: `ssh2::Session` is `Clone` (an `Arc` internally), so this is
+    /// also how the UI checks whether to enable the Transfer panel's
+    /// button without actually starting a transfer.
+    pub fn ssh_session(&self) -> Option<ssh2::Session> {
+        self.connection.as_ref().and_then(|c| c.clone_ssh_session())
     }
 
     pub fn log_path(&self) -> Option<&std::path::Path> {
@@ -418,8 +427,8 @@ impl Session {
         };
         match conn.read_available() {
             Ok(data) if !data.is_empty() => {
-                // Prototype: the real grid wants the raw escape sequences
-                // themselves, unlike the plain-text log below.
+                // The real grid wants the raw escape sequences themselves,
+                // unlike the plain-text log below.
                 self.vt_grid.process(&data);
                 let cleaned = self.ansi_filter.filter(&data);
                 self.append_log(&cleaned);
@@ -435,17 +444,28 @@ impl Session {
         }
     }
 
-    /// Prototype: the current state of the real terminal grid (see
-    /// `vtgrid.rs`), for `ui::draw_vt_grid` to paint.
+    /// The current state of the real terminal grid (see `vtgrid.rs`), for
+    /// `ui::draw_vt_grid` to paint.
     pub fn vt_screen(&self) -> &vt100::Screen {
         self.vt_grid.screen()
     }
 
-    /// Prototype: resize the real terminal grid to match the log area.
-    /// Unlike `request_resize` below, this is purely local (no debounce
-    /// needed) — only telling the *remote* the new size goes through that.
+    /// Resize the real terminal grid to match the log area. Unlike
+    /// `request_resize` below, this is purely local (no debounce needed)
+    /// — only telling the *remote* the new size goes through that.
     pub fn vt_resize(&mut self, cols: u32, rows: u32) {
         self.vt_grid.resize(cols, rows);
+    }
+
+    /// Scroll the real terminal grid's view by `delta` lines (positive =
+    /// back into history), e.g. from a mouse wheel over it.
+    pub fn vt_scroll_by(&mut self, delta: i64) {
+        self.vt_grid.scroll_by(delta);
+    }
+
+    /// Jump the real terminal grid's view back to the live tail.
+    pub fn vt_jump_to_live_tail(&mut self) {
+        self.vt_grid.jump_to_live_tail();
     }
 
     /// Note the log area's current size in characters. It is sent to the
@@ -936,6 +956,41 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with('[') && lines[0].ends_with("] remote line"));
         assert!(lines[1].starts_with('[') && lines[1].ends_with("] ls"));
+    }
+
+    #[test]
+    fn poll_connection_also_feeds_the_real_terminal_grid() {
+        // The plain-text log strips ANSI color; the real-terminal grid
+        // (fed the same raw bytes, unstripped) should still see it.
+        let conn = MockConnection { incoming: b"\x1b[31mhi\x1b[0m".to_vec() };
+        let mut session = Session::new(Box::new(conn), NewlineMode::Lf);
+        session.poll_connection();
+
+        assert_eq!(session.log_text(), "hi");
+        assert_eq!(session.vt_screen().cell(0, 0).unwrap().contents(), "h");
+        assert_eq!(session.vt_screen().cell(0, 0).unwrap().fgcolor(), vt100::Color::Idx(1));
+    }
+
+    #[test]
+    fn vt_resize_and_scroll_delegate_to_the_grid() {
+        let conn = MockConnection { incoming: Vec::new() };
+        let mut session = Session::new(Box::new(conn), NewlineMode::Lf);
+
+        session.vt_resize(100, 40);
+        let (rows, cols) = session.vt_screen().size();
+        assert_eq!((rows.get(), cols.get()), (40, 100));
+
+        // `vt_grid` is private, but tests are a child module of `app`, so
+        // this reaches straight into it rather than round-tripping actual
+        // bytes through a `Connection` — `vtgrid.rs`'s own tests already
+        // cover the scrollback-anchoring behavior in depth.
+        for i in 0..100 {
+            session.vt_grid.process(format!("line {i}\r\n").as_bytes());
+        }
+        session.vt_scroll_by(1_000_000);
+        assert!(session.vt_screen().scrollback() > 0);
+        session.vt_jump_to_live_tail();
+        assert_eq!(session.vt_screen().scrollback(), 0);
     }
 
     type SentSizes = std::sync::Arc<std::sync::Mutex<Vec<(u32, u32)>>>;

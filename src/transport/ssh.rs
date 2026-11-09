@@ -172,4 +172,8 @@ impl Connection for SshConnection {
         let _ = self.channel.close();
         let _ = self.channel.wait_close();
     }
+
+    fn clone_ssh_session(&self) -> Option<Session> {
+        Some(self.session.clone())
+    }
 }
