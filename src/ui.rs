@@ -6,6 +6,8 @@
 //! cell. Note cells are never sent — they hold Markdown documentation and
 //! are rendered inline. Both are saved/loaded together as an XML file.
 
+use std::path::Path;
+
 use eframe::egui::{self, Color32, ComboBox, RichText, ScrollArea, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
@@ -684,6 +686,59 @@ pub fn draw_transfer(
         }
     });
 
+    action
+}
+
+pub enum DropDialogAction {
+    None,
+    /// Upload pressed; the caller starts the transfer using the local
+    /// path the file was dropped with and the (possibly edited) remote
+    /// path.
+    Confirm,
+    /// Cancelled — clicked Cancel, pressed Escape, or clicked outside
+    /// the modal.
+    Cancel,
+}
+
+/// Destination popup shown after a file is dropped on the window (see
+/// `GuiApp::poll_dropped_files`) — the first modal in this app, since
+/// every other dialog here is a side panel. The local path is fixed by
+/// what was dropped and shown read-only; only the remote path is
+/// editable. Call only while a drop is pending.
+pub fn draw_drop_dialog(
+    ui: &mut egui::Ui,
+    local_path: &Path,
+    remote_path: &mut String,
+    error: Option<&str>,
+) -> DropDialogAction {
+    let mut action = DropDialogAction::None;
+
+    let modal = egui::Modal::new(egui::Id::new("drop_dialog")).show(ui.ctx(), |ui| {
+        ui.heading("Upload file");
+        ui.label(format!("Send \u{201c}{}\u{201d} to:", local_path.display()));
+        ui.add(
+            TextEdit::singleline(remote_path).desired_width(300.0).hint_text("/remote/path/filename"),
+        );
+
+        if let Some(err) = error {
+            ui.colored_label(Color32::from_rgb(220, 60, 60), err);
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!remote_path.trim().is_empty(), egui::Button::new("Upload")).clicked() {
+                action = DropDialogAction::Confirm;
+            }
+            if ui.button("Cancel").clicked() {
+                action = DropDialogAction::Cancel;
+            }
+        });
+    });
+
+    // Escape or a click outside the modal doesn't reach the buttons above.
+    if modal.should_close() {
+        action = DropDialogAction::Cancel;
+    }
     action
 }
 
