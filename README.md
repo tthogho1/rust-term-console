@@ -88,6 +88,13 @@ background thread so a large file doesn't freeze the window, and shows a
 progress bar while it's going. Only one file at a time — no recursive
 directory copy (like Tera Term's own basic SCP feature, not `scp -r`).
 
+You can also just **drag a file onto the window** (SSH connections only)
+to upload it: a popup asks for the remote destination, pre-filled with
+the dropped file's name, then **Upload** sends it through the same
+`transport::scp` path as the panel — so the Transfer panel's progress bar
+is where you watch it, whether or not it was open when you dropped the
+file.
+
 ## Using the app
 
 **Connect screen** (FR-2, FR-3, FR-O4):
@@ -204,6 +211,15 @@ directory copy (like Tera Term's own basic SCP feature, not `scp -r`).
   itself already uses for its interactive channel — both channels share
   one underlying session, so holding it for a whole big file at once
   would stall the interactive terminal too.
+- Drag-and-drop needs no extra setup: `egui`'s native (`egui-winit`)
+  backend fills `ctx.input(|i| i.raw.dropped_files)` straight from OS
+  drag-and-drop events, `DroppedFile::path` and all. `main.rs`'s
+  `poll_dropped_files` reads that once a frame and, if nothing else
+  already claims it (an open popup, a running transfer) and the
+  connection is SSH, opens `ui::draw_drop_dialog` — an `egui::Modal`
+  (the one modal in this app; everything else is a side panel) asking
+  for the remote path before handing off to the same `start_transfer`
+  the Transfer panel's own button calls.
 - `app.rs` holds `ConnectForm` (the dialog's fields and profile
   load/save/connect logic) and `Session` (log buffer capped at 2 MB, input
   line, sent-line history capped at 500 entries, connection status) — both
@@ -280,11 +296,12 @@ Matches the spec's phased roadmap — not yet implemented:
   on the UI thread (unlike connecting, which now runs in the background),
   so a slow (if bounded) script still briefly freezes the window.
 - Multiple concurrent connections / tabs (FR-O2).
-- Transfer is one file at a time: no recursive directory copy, no
-  queueing a batch of transfers, and no drag-and-drop — fill in the
-  panel's two path fields and click Transfer. Disconnecting (or the
-  remote closing the connection) while a transfer is running will fail
-  it with an error rather than resuming later.
+- Transfer is one file at a time: no recursive directory copy and no
+  queueing a batch of transfers. Dropping more than one file at once (or
+  a directory) is rejected with an error rather than picking one or
+  recursing. Disconnecting (or the remote closing the connection) while
+  a transfer is running will fail it with an error rather than resuming
+  later.
 - Telnet always negotiates plain NVT mode, refusing every option (FR-O1 is
   done, but see `transport/telnet.rs`): no character-at-a-time input (the
   input bar sends whole lines either way, so this matches how SSH/serial

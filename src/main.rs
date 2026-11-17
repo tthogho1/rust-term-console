@@ -23,7 +23,7 @@ use logfile::LogFile;
 use notebook::Cell;
 use script::ScriptAction;
 use transport::Connection;
-use ui::{ConnectAction, HeaderAction, NotebookAction, ScriptPanelAction, TransferPanelAction};
+use ui::{ConnectAction, DropDialogAction, HeaderAction, NotebookAction, ScriptPanelAction, TransferPanelAction};
 
 /// A connect attempt running on a background thread (see `GuiApp::connect`),
 /// polled once per frame rather than blocked on.
@@ -74,6 +74,19 @@ struct GuiApp {
     transfer: Option<PendingTransfer>,
     /// Set when a transfer fails; cleared when one starts or succeeds.
     transfer_error: Option<String>,
+    /// A file dropped on the window, awaiting a remote destination in the
+    /// popup (see `ui::draw_drop_dialog`). `None` means no popup is shown.
+    pending_drop: Option<PendingDrop>,
+}
+
+/// A locally dropped file, on its way to becoming an upload — see
+/// `GuiApp::poll_dropped_files` and the `pending_drop` match arm in `ui()`.
+struct PendingDrop {
+    local_path: std::path::PathBuf,
+    /// Editable in the popup; pre-filled with just the dropped file's
+    /// name (this app has nothing like a "last used remote directory" to
+    /// borrow a smarter default from).
+    remote_path: String,
 }
 
 /// The transfer panel's own fields — a local path, a remote path, and
@@ -124,6 +137,7 @@ impl Default for GuiApp {
             transfer_form: TransferForm::default(),
             transfer: None,
             transfer_error: None,
+            pending_drop: None,
         }
     }
 }
@@ -321,12 +335,48 @@ impl GuiApp {
             }
         }
     }
+
+    /// Check for a file just dropped on the window and, if nothing else
+    /// claims it first, open the destination popup for it. Call once per
+    /// frame, before drawing it (see the `pending_drop` match arm in
+    /// `ui()`) — `egui-winit` fills `dropped_files` from real OS
+    /// drag-and-drop events with no extra setup needed, and drains it
+    /// again every frame, so there's nothing to clear here ourselves.
+    fn poll_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        if self.pending_drop.is_some() || self.transfer.is_some() {
+            // A popup is already open, or a transfer is already running;
+            // ignore rather than stacking state — the same way the
+            // Transfer panel just disables its button mid-transfer
+            // without raising an error.
+            return;
+        }
+        if dropped.len() > 1 {
+            self.transfer_error = Some("Drop one file at a time".to_string());
+            return;
+        }
+        let Some(path) = dropped[0].path.clone() else {
+            self.transfer_error = Some("Dropped item has no file path".to_string());
+            return;
+        };
+        let can_transfer = self.session.as_ref().is_some_and(|s| s.ssh_session().is_some());
+        if !can_transfer {
+            self.transfer_error = Some("File transfer needs an SSH connection".to_string());
+            return;
+        }
+        let remote_path = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.pending_drop = Some(PendingDrop { local_path: path, remote_path });
+    }
 }
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_connect();
         self.poll_transfer();
+        self.poll_dropped_files(ui.ctx());
         if self.connecting.is_some() || self.transfer.is_some() {
             // Keep polling even without mouse/keyboard input, same reason
             // draw_terminal does this while connected (see below).
@@ -448,6 +498,29 @@ impl eframe::App for GuiApp {
             );
             if let TransferPanelAction::Start = action {
                 self.start_transfer();
+            }
+        }
+
+        if let Some(pending) = self.pending_drop.as_mut() {
+            let action = ui::draw_drop_dialog(
+                ui,
+                &pending.local_path,
+                &mut pending.remote_path,
+                self.transfer_error.as_deref(),
+            );
+            match action {
+                DropDialogAction::None => {}
+                DropDialogAction::Confirm => {
+                    self.transfer_form.local_path = pending.local_path.display().to_string();
+                    self.transfer_form.remote_path = pending.remote_path.clone();
+                    self.transfer_form.upload = true;
+                    self.pending_drop = None;
+                    self.start_transfer();
+                }
+                DropDialogAction::Cancel => {
+                    self.pending_drop = None;
+                    self.transfer_error = None;
+                }
             }
         }
 
